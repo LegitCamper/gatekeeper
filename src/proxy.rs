@@ -758,22 +758,22 @@ mod tests {
     #[tokio::test]
     async fn token_restores_across_different_requests() {
         let target = echo_upstream("application/json").await;
-        let app = router(state(&target));
+        let state = state(&target);
+        let original = "alice@example.com";
+        let token = state.detector.anonymize(original).text;
+        let app = router(state);
 
         let stored = Request::builder()
             .method("POST")
             .uri("/v1/messages")
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(
-                serde_json::to_vec(&json!({"content": PROMPT})).expect("serialized body"),
+                serde_json::to_vec(&json!({"content": original})).expect("serialized body"),
             ))
             .expect("built request");
         let response = app.clone().oneshot(stored).await.expect("first response");
-        let first_text = body_text(response).await;
-        assert!(first_text.contains("alice@example.com"));
+        assert!(body_text(response).await.contains(original));
 
-        let detector = Detector::default();
-        let token = detector.anonymize("alice@example.com").text;
         let follow_up = Request::builder()
             .method("POST")
             .uri("/v1/messages")
@@ -784,8 +784,7 @@ mod tests {
             .expect("built request");
         let response = app.oneshot(follow_up).await.expect("second response");
 
-        let text = body_text(response).await;
-        assert!(text.contains("alice@example.com"));
+        assert!(body_text(response).await.contains(original));
     }
 
     #[tokio::test]
