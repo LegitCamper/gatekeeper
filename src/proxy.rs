@@ -110,7 +110,7 @@ async fn proxy(State(state): State<ProxyState>, request: Request<Body>) -> Respo
     };
 
     let outgoing_body = if content_type.as_deref().is_some_and(is_json) {
-        match anonymize_json_body(&body, &state.detector) {
+        match anonymize_json_body(&body, &state.detector, &state.vault) {
             Ok((body, mappings)) => {
                 tracing::debug!("anonymize_json_body: found {} mappings", mappings.len());
                 if !mappings.is_empty() {
@@ -231,11 +231,20 @@ async fn upstream_response(upstream: reqwest::Response, state: &ProxyState) -> R
 fn anonymize_json_body(
     body: &[u8],
     detector: &Detector,
+    vault: &MemoryVault,
 ) -> Result<(Bytes, HashMap<String, String>), serde_json::Error> {
     let mut value: Value = serde_json::from_slice(body)?;
-    let mut mappings = HashMap::new();
-    anonymize_json(&mut value, detector, &mut mappings);
-    Ok((Bytes::from(serde_json::to_vec(&value)?), mappings))
+    let mappings = vault.lookup();
+
+    // Unredact known tokens first, so re-anonymization finds real values, not token strings
+    if !mappings.is_empty() {
+        restore_json(&mut value, &mappings);
+        tracing::debug!("unredacted {} known tokens from request", mappings.len());
+    }
+
+    let mut new_mappings = HashMap::new();
+    anonymize_json(&mut value, detector, &mut new_mappings);
+    Ok((Bytes::from(serde_json::to_vec(&value)?), new_mappings))
 }
 
 fn anonymize_json(value: &mut Value, detector: &Detector, mappings: &mut HashMap<String, String>) {
@@ -593,6 +602,10 @@ mod tests {
     #[test]
     fn anonymizes_nested_json_strings() {
         let detector = Detector::default();
+        let vault = MemoryVault::new(VaultConfig {
+            ttl: Duration::from_secs(60),
+            max_entries: 100,
+        });
         let body = json!({
             "model": "claude-opus-5",
             "max_tokens": 256,
@@ -601,7 +614,8 @@ mod tests {
         });
         let raw = serde_json::to_vec(&body).expect("serialized body");
 
-        let (anonymized, mappings) = anonymize_json_body(&raw, &detector).expect("anonymized body");
+        let (anonymized, mappings) =
+            anonymize_json_body(&raw, &detector, &vault).expect("anonymized body");
         let text = String::from_utf8(anonymized.to_vec()).expect("utf-8 body");
 
         assert!(!text.contains("alice@example.com"));
