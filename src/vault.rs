@@ -89,7 +89,7 @@ impl MemoryVault {
     fn oldest_mapping(&self) -> Option<String> {
         self.mappings
             .iter()
-            .min_by_key(|entry| entry.seen_at)
+            .min_by_key(|entry| entry.value().seen_at)
             .map(|entry| entry.key().clone())
     }
 }

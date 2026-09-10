@@ -655,4 +655,18 @@ mod tests {
         assert_eq!(anonymized.text, "summarize the quarterly report");
         assert!(anonymized.mappings.is_empty());
     }
+
+    #[test]
+    fn debug_detect_token() {
+        let detector = Detector::default();
+        let text = "reach me at [EMAIL_9c0343c78a5f].";
+        let detections = detector.scan(text);
+        println!("\nScanning: '{}'", text);
+        for d in &detections {
+            println!("  Found: kind={:?}, value='{}', span=[{}..{}]", d.kind, d.value, d.start, d.end);
+        }
+        if detections.is_empty() {
+            println!("  NO detections!");
+        }
+    }
 }

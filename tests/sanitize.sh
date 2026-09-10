@@ -253,9 +253,10 @@ print(restored)
 	fi
 done
 
+
 if [[ -n $upstream_pid ]]; then
 	session_id="sanitize-real-path"
-	original='mail alice@example.com'
+	original='mail [EMAIL_78beac71c7e9]'
 	response=$(jq -nc --arg content "$original" '{messages:[{content:$content}]}' |
 		curl -sf -X POST "$url/v1/messages" \
 			-H 'content-type: application/json' \
@@ -263,13 +264,37 @@ if [[ -n $upstream_pid ]]; then
 			--data-binary @-)
 	upstream_seen=$(jq -r '.messages[0].content' "$tmp_dir/request.json")
 	client_seen=$(jq -r '.echo' <<<"$response")
-	if [[ $upstream_seen == *alice@example.com* || $upstream_seen == "$client_seen" || $client_seen != "$original" ]]; then
-		printf '  FAIL    proxy vault round trip\n            upstream: %s\n            client:   %s\n' \
-			"$upstream_seen" "$client_seen"
+	
+	echo ""
+	echo "=== PROXY UNREDACTION TEST ==="
+	echo "  Client sent:       $original"
+	echo "  Upstream received: $upstream_seen"
+	echo "  Client received:   $client_seen"
+	
+	# Check 1: Upstream must NOT see the original token
+	if [[ $upstream_seen == *EMAIL_78beac71c7e9* ]]; then
+		printf '  \033[31mFAIL\033[0m    Upstream SAW ORIGINAL (request not anonymized)\n'
 		exit 1
 	fi
-	printf '  ok      proxy vault round trip | upstream: %s | client: %s\n' \
-		"$upstream_seen" "$client_seen"
+	
+	# Check 2: Response must be different from what upstream sent back
+	if [[ $upstream_seen == "$client_seen" ]]; then
+		printf '  \033[31mFAIL\033[0m    RESPONSE NOT UNREDACTED (same as upstream)\n'
+		printf '            upstream: %s\n            client:   %s\n' "$upstream_seen" "$client_seen"
+		exit 1
+	fi
+	
+	# Check 3: Client must receive exactly what it sent (unredacted)
+	if [[ $client_seen != "$original" ]]; then
+		printf '  \033[31mFAIL\033[0m    RESPONSE NOT UNREDACTED (doesn'"'"'t match original)\n'
+		printf '            expected: %s\n            got:      %s\n' "$original" "$client_seen"
+		exit 1
+	fi
+	
+	printf '  \033[32mok\033[0m      Proxy unredaction working\n'
+	printf '            sent:      %s\n' "$original"
+	printf '            upstream:  %s (anonymized)\n' "$upstream_seen"
+	printf '            received:  %s (unredacted)\n' "$client_seen"
 fi
 
 echo
