@@ -11,20 +11,51 @@ set -uo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 url=${URL:-}
 server_pid=""
+upstream_pid=""
+tmp_dir=$(mktemp -d)
 
 cleanup() {
 	[[ -n $server_pid ]] && kill "$server_pid" 2>/dev/null
+	[[ -n $upstream_pid ]] && kill "$upstream_pid" 2>/dev/null
+	rm -rf "$tmp_dir"
 	return 0
 }
 trap cleanup EXIT
 
 if [[ -z $url ]]; then
-	echo "building..." >&2
-	cargo build --quiet --release --manifest-path "$root/Cargo.toml" || exit 1
+	if [[ ! -x $root/target/debug/gatekeeper ]]; then
+		cargo build --quiet --manifest-path "$root/Cargo.toml" || exit 1
+	fi
 
-	port=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
-	url="http://127.0.0.1:$port"
-	LISTEN_ADDR="127.0.0.1:$port" RUST_LOG=error "$root/target/release/gatekeeper" &>/dev/null &
+	upstream_port=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
+	upstream_url="http://127.0.0.1:$upstream_port"
+	python3 - "$upstream_port" "$tmp_dir" <<'PY' &
+import json
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+port, tmp_dir = int(sys.argv[1]), sys.argv[2]
+class Handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("content-length", 0)))
+        with open(tmp_dir + "/request.json", "wb") as output:
+            output.write(body)
+        content = json.loads(body).get("messages", [{}])[0].get("content", "")
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps({"echo": content}).encode())
+    def log_message(self, *_):
+        pass
+
+HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+PY
+	upstream_pid=$!
+
+	gatekeeper_port=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
+	url="http://127.0.0.1:$gatekeeper_port"
+	TARGET_URL="$upstream_url" LISTEN_ADDR="127.0.0.1:$gatekeeper_port" RUST_LOG=error \
+		"$root/target/debug/gatekeeper" &>/dev/null &
 	server_pid=$!
 
 	for _ in $(seq 50); do
@@ -200,17 +231,46 @@ for entry in "${cases[@]}"; do
 	actual=$(jq -r '[.matches[].kind] | join(",")' <<<"$response")
 	[[ -z $actual ]] && actual="-"
 	sanitized=$(jq -r '.anonymized.text' <<<"$response")
+	restored=$(jq -c '.anonymized' <<<"$response" | python3 -c '
+import json
+import sys
 
-	if [[ $actual == "$expected" ]]; then
+anonymized = json.load(sys.stdin)
+restored = anonymized["text"]
+for token, value in anonymized["mappings"].items():
+    restored = restored.replace(token, value)
+print(restored)
+')
+
+	if [[ $actual == "$expected" && $restored == "$text" ]]; then
 		pass=$((pass + 1))
-		printf '  \033[32mok\033[0m      %s%s -> %s\n' "$(pad "$actual")" "$text" "$sanitized"
+		printf '  \033[32mok\033[0m      %s%s | redacted: %s | unredacted: %s\n' "$(pad "$actual")" "$text" "$sanitized" "$restored"
 	else
 		fail=$((fail + 1))
-		failed_output+=$(printf '  \033[31mFAIL\033[0m    %s\n            expected: %s\n            actual:   %s\n            -> %s\n' \
-			"$text" "$expected" "$actual" "$sanitized")
+		failed_output+=$(printf '  \033[31mFAIL\033[0m    %s\n            expected: %s\n            actual:   %s\n            before:   %s\n            redacted: %s\n            unredacted: %s\n' \
+			"$text" "$expected" "$actual" "$text" "$sanitized" "$restored")
 		failed_output+=$'\n'
 	fi
 done
+
+if [[ -n $upstream_pid ]]; then
+	session_id="sanitize-real-path"
+	original='mail alice@example.com'
+	response=$(jq -nc --arg content "$original" '{messages:[{content:$content}]}' |
+		curl -sf -X POST "$url/v1/messages" \
+			-H 'content-type: application/json' \
+			-H "x-session-id: $session_id" \
+			--data-binary @-)
+	upstream_seen=$(jq -r '.messages[0].content' "$tmp_dir/request.json")
+	client_seen=$(jq -r '.echo' <<<"$response")
+	if [[ $upstream_seen == *alice@example.com* || $upstream_seen == "$client_seen" || $client_seen != "$original" ]]; then
+		printf '  FAIL    proxy vault round trip\n            upstream: %s\n            client:   %s\n' \
+			"$upstream_seen" "$client_seen"
+		exit 1
+	fi
+	printf '  ok      proxy vault round trip | upstream: %s | client: %s\n' \
+		"$upstream_seen" "$client_seen"
+fi
 
 echo
 [[ -n $failed_output ]] && printf '%s' "$failed_output"

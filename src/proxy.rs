@@ -279,19 +279,107 @@ fn restored_sse(
     try_stream! {
         futures_util::pin_mut!(source);
         let mut carry = BytesMut::new();
+        let mut token_carry = String::new();
         while let Some(chunk) = source.next().await {
             carry.extend_from_slice(&chunk?);
             while let Some(newline) = carry.iter().position(|byte| *byte == b'\n') {
-                let line = carry.split_to(newline + 1);
-                let restored = restore(&String::from_utf8_lossy(&line), &mappings);
-                yield Bytes::from(restored);
+                let line_end = newline + 1;
+                let line = &carry[..line_end];
+                match std::str::from_utf8(line) {
+                    Ok(_) => {
+                        let line = carry.split_to(line_end);
+                        let line = std::str::from_utf8(&line).expect("validated UTF-8 SSE line");
+                        yield Bytes::from(restore_sse_line(line, &mut token_carry, &mappings));
+                    }
+                    Err(error) if error.error_len().is_none() => break,
+                    Err(_) => {
+                        yield carry.split_to(line_end).freeze();
+                    }
+                }
             }
         }
         if !carry.is_empty() {
-            let restored = restore(&String::from_utf8_lossy(&carry), &mappings);
-            yield Bytes::from(restored);
+            match std::str::from_utf8(&carry) {
+                Ok(_) => {
+                    let line = carry.split().freeze();
+                    let line = std::str::from_utf8(&line).expect("validated UTF-8 SSE tail");
+                    yield Bytes::from(restore_sse_line(line, &mut token_carry, &mappings));
+                }
+                Err(_) => yield carry.split().freeze(),
+            }
+        }
+        if !token_carry.is_empty() {
+            yield Bytes::from(std::mem::take(&mut token_carry));
         }
     }
+}
+
+fn restore_sse_line(
+    line: &str,
+    token_carry: &mut String,
+    mappings: &HashMap<String, String>,
+) -> String {
+    let (content, newline) = line
+        .strip_suffix('\n')
+        .map_or((line, ""), |content| (content, "\n"));
+    let mut restored = String::with_capacity(line.len());
+
+    if let Some(payload) = content.strip_prefix("data:") {
+        let separator_len = payload.starts_with(' ') as usize;
+        let (separator, payload) = payload.split_at(separator_len);
+        restored.push_str("data:");
+        restored.push_str(separator);
+        let payload = if token_carry.is_empty() {
+            payload.to_owned()
+        } else {
+            let mut joined = std::mem::take(token_carry);
+            joined.push_str(payload);
+            joined
+        };
+        restored.push_str(&restore_stream_text(&payload, token_carry, mappings));
+    } else {
+        if !token_carry.is_empty() {
+            restored.push_str(&std::mem::take(token_carry));
+        }
+        restored.push_str(&restore_stream_text(content, token_carry, mappings));
+    }
+    restored.push_str(newline);
+    restored
+}
+
+fn restore_stream_text(
+    text: &str,
+    token_carry: &mut String,
+    mappings: &HashMap<String, String>,
+) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0;
+
+    while cursor < text.len() {
+        let Some(relative) = text[cursor..].find('[') else {
+            output.push_str(&text[cursor..]);
+            break;
+        };
+        let start = cursor + relative;
+        output.push_str(&text[cursor..start]);
+        let tail = &text[start..];
+
+        if let Some((token, original)) = mappings
+            .iter()
+            .find(|(token, _)| tail.starts_with(token.as_str()))
+        {
+            output.push_str(original);
+            cursor = start + token.len();
+        } else if mappings.keys().any(|token| token.starts_with(tail)) {
+            token_carry.push_str(tail);
+            break;
+        } else {
+            output.push('[');
+            cursor = start + 1;
+        }
+    }
+
+    output
 }
 
 enum LimitedBodyError {
@@ -535,6 +623,59 @@ mod tests {
         assert_eq!(restored, body);
     }
 
+    #[tokio::test]
+    async fn restores_sse_token_split_across_events() {
+        let detector = Detector::default();
+        let anonymized = detector.anonymize("mail alice@example.com");
+        let token = anonymized
+            .mappings
+            .keys()
+            .next()
+            .expect("email token")
+            .clone();
+        let split = token.len() / 2;
+        let event = format!(
+            ": keep\nevent: completion\ndata: {{\"text\":\"{}\ndata: {}\"}}\n\ndata: [DONE]\n\n",
+            &token[..split],
+            &token[split..]
+        );
+        let stream = restored_sse(
+            futures_util::stream::iter([Ok(Bytes::from(event))]),
+            anonymized.mappings,
+        );
+        futures_util::pin_mut!(stream);
+
+        let mut output = String::new();
+        while let Some(chunk) = stream.next().await {
+            output.push_str(std::str::from_utf8(&chunk.expect("chunk")).expect("utf-8"));
+        }
+
+        assert!(output.contains("alice@example.com"));
+        assert!(!output.contains(&token));
+        assert!(output.contains(": keep\nevent: completion\n"));
+        assert!(output.ends_with("data: [DONE]\n\n"));
+    }
+
+    #[test]
+    fn stream_restore_leaves_unknown_and_partial_tokens_unchanged() {
+        let mappings =
+            HashMap::from([(String::from("[EMAIL_0123456789ab]"), String::from("known"))]);
+        let mut carry = String::new();
+
+        assert_eq!(
+            restore_stream_text("unknown [EMAIL_ffffffffffff]", &mut carry, &mappings),
+            "unknown [EMAIL_ffffffffffff]"
+        );
+        assert_eq!(
+            restore_stream_text("[EMAIL_0123", &mut carry, &mappings),
+            ""
+        );
+        assert_eq!(carry, "[EMAIL_0123");
+        let mut second = std::mem::take(&mut carry);
+        second.push_str("456789ab]");
+        assert_eq!(restore_stream_text(&second, &mut carry, &mappings), "known");
+        assert!(carry.is_empty());
+    }
     #[tokio::test]
     async fn restores_sse_across_arbitrary_chunk_boundaries() {
         let detector = Detector::default();
