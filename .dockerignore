@@ -1,0 +1,7 @@
+.git
+.github
+.env
+target
+coverage
+*.swp
+.DS_Store

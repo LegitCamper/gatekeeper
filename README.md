@@ -25,6 +25,24 @@ cargo run --release
 
 Gatekeeper is authless: it never checks a client credential. `UPSTREAM_API_KEY` is the credential it presents to the upstream, and it replaces whatever the client sent so a stale client key cannot leak past the proxy. Leave it unset to forward the client's own auth headers unchanged.
 
+### Docker
+
+Images are published to `ghcr.io/legitcamper/gatekeeper`. Pushes to `main` publish `main` and `latest`; tags such as `v1.2.3` also publish `v1.2.3`, `1.2.3`, and `1.2`.
+
+```bash
+docker pull ghcr.io/legitcamper/gatekeeper:latest
+docker run --rm --env-file .env -p 8080:8080 ghcr.io/legitcamper/gatekeeper:latest
+```
+
+For Compose, copy the environment template, set a reachable upstream, then start the example:
+
+```bash
+cp .env.example .env
+docker compose -f compose.example.yml up -d
+```
+
+Inside a container, `localhost` refers to that container. Set `TARGET_URL` to an upstream Compose service name such as `http://ollama:11434`, or another host reachable from the container. If the GHCR package is private, authenticate first with `docker login ghcr.io`. Run one Gatekeeper replica unless requests use sticky sessions because vault mappings live only in process memory.
+
 The default listen address is `0.0.0.0:8080`. Send provider requests to Gatekeeper using the same path and headers you would send upstream:
 
 ```bash
