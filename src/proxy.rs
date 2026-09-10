@@ -112,8 +112,10 @@ async fn proxy(State(state): State<ProxyState>, request: Request<Body>) -> Respo
     let outgoing_body = if content_type.as_deref().is_some_and(is_json) {
         match anonymize_json_body(&body, &state.detector) {
             Ok((body, mappings)) => {
+                tracing::debug!("anonymize_json_body: found {} mappings", mappings.len());
                 if !mappings.is_empty() {
                     state.vault.store(mappings);
+                    tracing::debug!("stored mappings in vault");
                 }
                 body
             }
@@ -125,6 +127,7 @@ async fn proxy(State(state): State<ProxyState>, request: Request<Body>) -> Respo
             }
         }
     } else {
+        tracing::debug!("request not JSON, skipping anonymization");
         body
     };
 
@@ -162,6 +165,8 @@ async fn upstream_response(upstream: reqwest::Response, state: &ProxyState) -> R
     let response_connection_headers = connection_headers(&headers);
     let response_type = content_type(&headers).map(str::to_owned);
     let mappings = state.vault.lookup();
+
+    tracing::debug!("upstream_response: content-type={:?}, mappings={}", response_type, mappings.len());
 
     let body = if response_type.as_deref().is_some_and(is_json) {
         let bytes = match collect_limited(upstream.bytes_stream(), state.max_body_bytes).await {
