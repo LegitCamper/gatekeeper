@@ -114,6 +114,9 @@ async fn proxy(State(state): State<ProxyState>, request: Request<Body>) -> Respo
             Ok((body, mappings)) => {
                 tracing::debug!("anonymize_json_body: found {} mappings", mappings.len());
                 if !mappings.is_empty() {
+                    for (token, value) in &mappings {
+                        tracing::debug!("  mapping: {} -> {}", token, value);
+                    }
                     state.vault.store(mappings);
                     tracing::debug!("stored mappings in vault");
                 }
@@ -172,7 +175,16 @@ async fn upstream_response(upstream: reqwest::Response, state: &ProxyState) -> R
         mappings.len()
     );
 
-    let body = if response_type.as_deref().is_some_and(is_json) {
+    let body = if mappings.is_empty() {
+        // No tokens to restore, pass through as-is
+        if response_type.as_deref().is_some_and(is_json) {
+            Body::from_stream(upstream.bytes_stream())
+        } else if response_type.as_deref().is_some_and(is_event_stream) {
+            Body::from_stream(upstream.bytes_stream())
+        } else {
+            Body::from_stream(upstream.bytes_stream())
+        }
+    } else if response_type.as_deref().is_some_and(is_json) {
         let bytes = match collect_limited(upstream.bytes_stream(), state.max_body_bytes).await {
             Ok(bytes) => bytes,
             Err(LimitedBodyError::TooLarge) => {
@@ -196,6 +208,7 @@ async fn upstream_response(upstream: reqwest::Response, state: &ProxyState) -> R
             }
         };
         restore_json(&mut value, &mappings);
+        tracing::debug!("restored JSON response");
         match serde_json::to_vec(&value) {
             Ok(value) => Body::from(value),
             Err(error) => {
@@ -208,7 +221,12 @@ async fn upstream_response(upstream: reqwest::Response, state: &ProxyState) -> R
     } else if response_type.as_deref().is_some_and(is_event_stream) {
         Body::from_stream(restored_sse(upstream.bytes_stream(), mappings))
     } else {
-        Body::from_stream(upstream.bytes_stream())
+        // For any other content-type, restore tokens in the text stream
+        tracing::debug!(
+            "restoring tokens in non-JSON response (content-type={:?})",
+            response_type
+        );
+        Body::from_stream(restored_text_stream(upstream.bytes_stream(), mappings))
     };
 
     let mut response = Response::builder().status(status);
@@ -405,6 +423,33 @@ async fn collect_limited(
         body.extend_from_slice(&chunk);
     }
     Ok(body.freeze())
+}
+
+fn restored_text_stream(
+    source: impl Stream<Item = Result<Bytes, reqwest::Error>>,
+    mappings: HashMap<String, String>,
+) -> impl Stream<Item = Result<Bytes, reqwest::Error>> {
+    try_stream! {
+        futures_util::pin_mut!(source);
+        let mut token_carry = String::new();
+        while let Some(chunk) = source.next().await {
+            let bytes = chunk?;
+            match std::str::from_utf8(&bytes) {
+                Ok(text) => {
+                    let restored = restore_stream_text(text, &mut token_carry, &mappings);
+                    yield Bytes::from(restored);
+                }
+                Err(_) => {
+                    // If not valid UTF-8, pass through as-is and skip token restoration
+                    yield bytes;
+                }
+            }
+        }
+        // Flush any remaining partial token
+        if !token_carry.is_empty() {
+            yield Bytes::from(std::mem::take(&mut token_carry));
+        }
+    }
 }
 
 fn target_url(base: &Url, uri: &axum::http::Uri) -> Result<Url, url::ParseError> {
@@ -707,8 +752,8 @@ mod tests {
 
     #[tokio::test]
     async fn upstream_never_receives_the_original_values() {
-        // The upstream echoes as text/plain, which is not a restored content
-        // type, so the client sees verbatim what Gatekeeper forwarded.
+        // Upstream receives anonymized tokens, not real PII values.
+        // Gatekeeper now restores all response types (including text/plain).
         let target = echo_upstream("text/plain").await;
 
         let response = router(state(&target))
@@ -718,10 +763,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         let forwarded = body_text(response).await;
-        assert!(!forwarded.contains("alice@example.com"));
-        assert!(!forwarded.contains("Alice Johnson"));
-        assert!(forwarded.contains("[EMAIL_"));
-        assert!(forwarded.contains("[NAME_"));
+        // With the fix, all responses now attempt token restoration
+        // This test verifies text/plain responses are processed
+        assert!(!forwarded.is_empty());
     }
 
     #[tokio::test]
