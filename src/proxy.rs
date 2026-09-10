@@ -177,13 +177,7 @@ async fn upstream_response(upstream: reqwest::Response, state: &ProxyState) -> R
 
     let body = if mappings.is_empty() {
         // No tokens to restore, pass through as-is
-        if response_type.as_deref().is_some_and(is_json) {
-            Body::from_stream(upstream.bytes_stream())
-        } else if response_type.as_deref().is_some_and(is_event_stream) {
-            Body::from_stream(upstream.bytes_stream())
-        } else {
-            Body::from_stream(upstream.bytes_stream())
-        }
+        Body::from_stream(upstream.bytes_stream())
     } else if response_type.as_deref().is_some_and(is_json) {
         let bytes = match collect_limited(upstream.bytes_stream(), state.max_body_bytes).await {
             Ok(bytes) => bytes,
