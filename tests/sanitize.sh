@@ -256,7 +256,7 @@ done
 
 if [[ -n $upstream_pid ]]; then
 	session_id="sanitize-real-path"
-	original='mail [EMAIL_78beac71c7e9]'
+	original='mail alice@example.com today'
 	response=$(jq -nc --arg content "$original" '{messages:[{content:$content}]}' |
 		curl -sf -X POST "$url/v1/messages" \
 			-H 'content-type: application/json' \
