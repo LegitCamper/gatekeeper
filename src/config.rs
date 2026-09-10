@@ -9,8 +9,7 @@ use crate::vault::VaultConfig;
 
 const DEFAULT_LISTEN_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8080);
 const DEFAULT_VAULT_TTL_SECS: u64 = 30 * 60;
-const DEFAULT_MAX_SESSIONS: usize = 10_000;
-const DEFAULT_MAX_ENTRIES_PER_SESSION: usize = 1_000;
+const DEFAULT_MAX_ENTRIES: usize = 100_000;
 const DEFAULT_MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 const DEFAULT_UPSTREAM_AUTH_HEADER: &str = "x-api-key";
 
@@ -33,11 +32,7 @@ impl Config {
             .parse()
             .map_err(ConfigError::TargetUrl)?;
         let ttl_secs = parse_env("GATEKEEPER_VAULT_TTL_SECS", DEFAULT_VAULT_TTL_SECS)?;
-        let max_sessions = parse_env("GATEKEEPER_MAX_SESSIONS", DEFAULT_MAX_SESSIONS)?;
-        let max_entries_per_session = parse_env(
-            "GATEKEEPER_MAX_ENTRIES_PER_SESSION",
-            DEFAULT_MAX_ENTRIES_PER_SESSION,
-        )?;
+        let max_entries = parse_env("GATEKEEPER_MAX_ENTRIES", DEFAULT_MAX_ENTRIES)?;
         let max_body_bytes = parse_env("GATEKEEPER_MAX_BODY_BYTES", DEFAULT_MAX_BODY_BYTES)?;
         let upstream_auth = upstream_auth()?;
 
@@ -46,8 +41,7 @@ impl Config {
             target_url,
             vault: VaultConfig {
                 ttl: Duration::from_secs(ttl_secs),
-                max_sessions,
-                max_entries_per_session,
+                max_entries,
             },
             max_body_bytes,
             upstream_auth,

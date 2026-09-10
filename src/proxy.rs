@@ -91,7 +91,6 @@ async fn scan(State(state): State<ProxyState>, request: Request<Body>) -> Respon
 }
 
 async fn proxy(State(state): State<ProxyState>, request: Request<Body>) -> Response<Body> {
-    let session = session_id(request.headers());
     let content_type = content_type(request.headers()).map(str::to_owned);
     let connection_headers = connection_headers(request.headers());
     let method = request.method().clone();
@@ -114,7 +113,7 @@ async fn proxy(State(state): State<ProxyState>, request: Request<Body>) -> Respo
         match anonymize_json_body(&body, &state.detector) {
             Ok((body, mappings)) => {
                 if !mappings.is_empty() {
-                    state.vault.store(&session, mappings);
+                    state.vault.store(mappings);
                 }
                 body
             }
@@ -154,19 +153,15 @@ async fn proxy(State(state): State<ProxyState>, request: Request<Body>) -> Respo
         }
     };
 
-    upstream_response(upstream, &state, &session).await
+    upstream_response(upstream, &state).await
 }
 
-async fn upstream_response(
-    upstream: reqwest::Response,
-    state: &ProxyState,
-    session: &str,
-) -> Response<Body> {
+async fn upstream_response(upstream: reqwest::Response, state: &ProxyState) -> Response<Body> {
     let status = upstream.status();
     let headers = upstream.headers().clone();
     let response_connection_headers = connection_headers(&headers);
     let response_type = content_type(&headers).map(str::to_owned);
-    let mappings = state.vault.lookup(session);
+    let mappings = state.vault.lookup();
 
     let body = if response_type.as_deref().is_some_and(is_json) {
         let bytes = match collect_limited(upstream.bytes_stream(), state.max_body_bytes).await {
@@ -403,16 +398,6 @@ async fn collect_limited(
     Ok(body.freeze())
 }
 
-fn session_id(headers: &HeaderMap) -> String {
-    ["x-session-id", "x-request-id"]
-        .iter()
-        .filter_map(|name| headers.get(*name))
-        .filter_map(|value| value.to_str().ok())
-        .find(|value| !value.is_empty())
-        .unwrap_or("default")
-        .to_owned()
-}
-
 fn target_url(base: &Url, uri: &axum::http::Uri) -> Result<Url, url::ParseError> {
     let origin = &base[..Position::BeforePath];
     let base_path = base.path().trim_end_matches('/');
@@ -498,8 +483,7 @@ mod tests {
             Arc::new(Detector::default()),
             Arc::new(MemoryVault::new(VaultConfig {
                 ttl: Duration::from_secs(60),
-                max_sessions: 10,
-                max_entries_per_session: 100,
+                max_entries: 100,
             })),
             1024 * 1024,
             upstream_auth.map(|(name, value)| {
@@ -700,12 +684,11 @@ mod tests {
         assert!(output.contains("Alice Johnson"));
     }
 
-    fn messages_request(target_session: &str) -> Request<Body> {
+    fn messages_request() -> Request<Body> {
         Request::builder()
             .method("POST")
             .uri("/v1/messages")
             .header(header::CONTENT_TYPE, "application/json")
-            .header("x-session-id", target_session)
             .body(Body::from(
                 serde_json::to_vec(&json!({"messages": [{"content": PROMPT}]}))
                     .expect("serialized body"),
@@ -720,7 +703,7 @@ mod tests {
         let target = echo_upstream("text/plain").await;
 
         let response = router(state(&target))
-            .oneshot(messages_request("session-a"))
+            .oneshot(messages_request())
             .await
             .expect("proxied response");
         assert_eq!(response.status(), StatusCode::OK);
@@ -733,11 +716,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_sees_restored_ip_in_json_responses() {
+        let target = echo_upstream("application/json").await;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "messages": [{"content": "Connect to 192.0.2.42"}]
+                }))
+                .expect("serialized body"),
+            ))
+            .expect("built request");
+
+        let response = router(state(&target))
+            .oneshot(request)
+            .await
+            .expect("proxied response");
+
+        assert!(body_text(response).await.contains("192.0.2.42"));
+    }
+
+    #[tokio::test]
     async fn client_sees_restored_values_in_json_responses() {
         let target = echo_upstream("application/json").await;
 
         let response = router(state(&target))
-            .oneshot(messages_request("session-a"))
+            .oneshot(messages_request())
             .await
             .expect("proxied response");
         assert_eq!(response.status(), StatusCode::OK);
@@ -750,7 +756,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sessions_do_not_restore_each_others_tokens() {
+    async fn token_restores_across_different_requests() {
         let target = echo_upstream("application/json").await;
         let app = router(state(&target));
 
@@ -758,32 +764,28 @@ mod tests {
             .method("POST")
             .uri("/v1/messages")
             .header(header::CONTENT_TYPE, "application/json")
-            .header("x-session-id", "session-a")
             .body(Body::from(
                 serde_json::to_vec(&json!({"content": PROMPT})).expect("serialized body"),
             ))
             .expect("built request");
         let response = app.clone().oneshot(stored).await.expect("first response");
-        let anonymized_elsewhere = body_text(response).await;
-        assert!(anonymized_elsewhere.contains("alice@example.com"));
+        let first_text = body_text(response).await;
+        assert!(first_text.contains("alice@example.com"));
 
-        // A different session replaying the same prompt gets its own tokens and
-        // cannot resolve tokens minted for session-a.
-        let other = Request::builder()
+        let detector = Detector::default();
+        let token = detector.anonymize("alice@example.com").text;
+        let follow_up = Request::builder()
             .method("POST")
             .uri("/v1/messages")
             .header(header::CONTENT_TYPE, "application/json")
-            .header("x-session-id", "session-b")
             .body(Body::from(
-                serde_json::to_vec(&json!({"content": "no sensitive values here"}))
-                    .expect("serialized body"),
+                serde_json::to_vec(&json!({"content": token})).expect("serialized body"),
             ))
             .expect("built request");
-        let response = app.oneshot(other).await.expect("second response");
+        let response = app.oneshot(follow_up).await.expect("second response");
 
         let text = body_text(response).await;
-        assert!(!text.contains("alice@example.com"));
-        assert!(text.contains("no sensitive values here"));
+        assert!(text.contains("alice@example.com"));
     }
 
     #[tokio::test]

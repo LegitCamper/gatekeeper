@@ -7,12 +7,12 @@ Gatekeeper is a Rust/Axum reverse proxy that removes sensitive values before LLM
 - Detects and tokenizes common PII and secrets in JSON request strings.
 - Handles bare 10- and 11-digit, leading-`+`, dashed/dotted/parenthesized, international, and Vietnamese phone formats. Placeholder numbers such as `000-000-0000` are redacted too, so an undialable number in a prompt is still removed.
 - Detects person names from a ~19k-entry multi-origin given-name dictionary, plus any capitalized pair after a trigger word (`contact`, `cc:`, `regards,`, `Mr.`, `my name is`). Entries colliding with ordinary English words are excluded, and calendar/direction words are denied, so capitalized technical prose ("New York", "Redis Cluster", "Docker Compose") is left intact.
-- Stores token mappings by session in a concurrent bounded TTL vault.
+- Stores token mappings in one concurrent bounded global TTL vault.
 - Restores tokens in JSON and Server-Sent Event responses.
 - Proxies provider headers and payloads without translating Anthropic/OpenAI schemas.
 - Never requires Redis or another external state service.
 
-Mappings are process-local and intentionally disappear on restart. Run a single replica unless clients have sticky sessions; multi-replica deployments need a shared vault that is outside this core release's scope.
+Mappings live in one process-local global vault. Any request can resolve a known token; tokens remain opaque and are hard to guess without the token itself. Mappings expire after the configured TTL (default 30 minutes), refreshed whenever stored or read. Multi-replica deployments need a shared vault outside this core release's scope.
 
 ## Run
 
@@ -41,7 +41,7 @@ cp .env.example .env
 docker compose -f compose.example.yml up -d
 ```
 
-Inside a container, `localhost` refers to that container. Set `TARGET_URL` to an upstream Compose service name such as `http://ollama:11434`, or another host reachable from the container. If the GHCR package is private, authenticate first with `docker login ghcr.io`. Run one Gatekeeper replica unless requests use sticky sessions because vault mappings live only in process memory.
+Inside a container, `localhost` refers to that container. Set `TARGET_URL` to an upstream Compose service name such as `http://ollama:11434`, or another host reachable from the container. If the GHCR package is private, authenticate first with `docker login ghcr.io`. Run one Gatekeeper replica unless a shared vault is added because mappings live only in process memory.
 
 The default listen address is `0.0.0.0:8080`. Send provider requests to Gatekeeper using the same path and headers you would send upstream:
 
@@ -50,7 +50,7 @@ curl http://[IP_111]:8080/v1/messages \
   -H 'content-type: application/json' \
   -H "x-api-key: $ANTHROPIC_API_KEY" \
   -H 'anthropic-version: [DOB_1327]' \
-  -H 'x-session-id: example-session' \
+  -H 'x-request-id: example-request' \
   -d '{
     "model": "claude-opus-5",
     "max_tokens": 256,
@@ -58,7 +58,7 @@ curl http://[IP_111]:8080/v1/messages \
   }'
 ```
 
-Gatekeeper resolves the vault session from `X-Session-ID`, then `X-Request-ID`, and finally `default`. Use an explicit unique session ID in production to avoid cross-request token collisions.
+Mappings are global, so no session header is required. Use any request ID header when upstream observability needs correlation; it does not affect token restoration.
 
 ## Local endpoints
 
@@ -76,7 +76,7 @@ Gatekeeper resolves the vault session from `X-Session-ID`, then `X-Request-ID`, 
 | `UPSTREAM_AUTH_HEADER` | `x-api-key` | Header carrying it. Use `authorization` for Bearer gateways and include the `Bearer ` prefix in the value |
 | `GATEKEEPER_VAULT_TTL_SECS` | `1800` | Mapping lifetime, refreshed when storing |
 | `GATEKEEPER_MAX_SESSIONS` | `10000` | Maximum live sessions |
-| `GATEKEEPER_MAX_ENTRIES_PER_SESSION` | `1000` | Maximum token mappings per session |
+| `GATEKEEPER_MAX_ENTRIES` | `100000` | Maximum global token mappings |
 | `GATEKEEPER_MAX_BODY_BYTES` | `10485760` | Maximum buffered request/JSON response body |
 | `RUST_LOG` | `info` | Tracing filter |
 
