@@ -663,7 +663,10 @@ mod tests {
         let detections = detector.scan(text);
         println!("\nScanning: '{}'", text);
         for d in &detections {
-            println!("  Found: kind={:?}, value='{}', span=[{}..{}]", d.kind, d.value, d.start, d.end);
+            println!(
+                "  Found: kind={:?}, value='{}', span=[{}..{}]",
+                d.kind, d.value, d.start, d.end
+            );
         }
         if detections.is_empty() {
             println!("  NO detections!");

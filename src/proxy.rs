@@ -166,7 +166,11 @@ async fn upstream_response(upstream: reqwest::Response, state: &ProxyState) -> R
     let response_type = content_type(&headers).map(str::to_owned);
     let mappings = state.vault.lookup();
 
-    tracing::debug!("upstream_response: content-type={:?}, mappings={}", response_type, mappings.len());
+    tracing::debug!(
+        "upstream_response: content-type={:?}, mappings={}",
+        response_type,
+        mappings.len()
+    );
 
     let body = if response_type.as_deref().is_some_and(is_json) {
         let bytes = match collect_limited(upstream.bytes_stream(), state.max_body_bytes).await {
