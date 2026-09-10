@@ -119,6 +119,26 @@ const NAME_DENY: &[&str] = &[
     "East",
     "West",
     "New",
+    // Common nouns/words that are also given names
+    "Grace",
+    "Hope",
+    "Faith",
+    "Charity",
+    "Joy",
+    "Victory",
+    "Mark",
+    "Bill",
+    "Will",
+    "Rose",
+    "Lily",
+    "Iris",
+    "Daisy",
+    "Violet",
+    "Amber",
+    "Sage",
+    "Angel",
+    "Star",
+    "Art",
 ];
 
 pub struct Detector {
@@ -279,22 +299,33 @@ impl Detector {
         format!("[{}_{:012x}]", kind.label(), digest & 0xffff_ffff_ffff)
     }
 
-    /// Dictionary given name followed by a capitalized surname.
+    /// Dictionary given name, optionally followed by capitalized words (middle name, surname).
+    /// Reports single first names or multi-word name sequences.
     fn dictionary_names(&self, text: &str) -> Vec<Detection> {
         let bytes = text.as_bytes();
         let mut found = Vec::new();
 
         for candidate in self.given_names.find_iter(text) {
             let (start, given_end) = (candidate.start(), candidate.end());
+            // Ensure not matched mid-word (check both before and after)
             if start > 0 && is_word_byte(bytes[start - 1]) {
                 continue;
             }
-            let Some(end) = surname_end(text, given_end) else {
-                continue;
+            if given_end < text.len() && is_word_byte(bytes[given_end]) {
+                continue; // Given name is followed by more word characters (e.g., "Rus" in "Rust")
+            }
+
+            // Try to extend name with following capitalized words (surnames, middle names)
+            let end = match end_of_name(text, given_end) {
+                Some(e) => e,         // Has following capitalized word(s)
+                None => given_end,    // No following word, just use given name
             };
+
+            // Validate the detected name
             if validate(Kind::Name, text, start, end).is_none() {
                 continue;
             }
+
             found.push(Detection {
                 kind: Kind::Name,
                 value: text[start..end].to_owned(),
@@ -418,7 +449,66 @@ fn is_phone(value: &str) -> bool {
     (dialable && structured) || PHONE_SHAPES.iter().any(|shape| shape.is_match(value))
 }
 
+/// End position of capitalized word(s) following position, or None if not capitalized.
+/// Captures multi-word names like "Joe Smith" or "Joe Marie Smith".
+fn end_of_name(text: &str, start: usize) -> Option<usize> {
+    let rest = text.get(start..)?;
+    let rest = rest.strip_prefix(' ')?;
+    let first_word_start = start + 1;
+
+    let mut chars = rest.char_indices();
+    let (_, first) = chars.next()?;
+    if !first.is_ascii_uppercase() {
+        return None;
+    }
+
+    // Find the end of the first capitalized word
+    let end = rest
+        .char_indices()
+        .find(|(_, c)| !c.is_ascii_alphabetic())
+        .map_or(rest.len(), |(offset, _)| offset);
+
+    // Require at least 2 characters for a valid word
+    if end < 2 {
+        return None;
+    }
+
+    let mut current_end = first_word_start + end;
+
+    // Try to extend with additional capitalized words (middle names, surnames, etc.)
+    loop {
+        let next_rest = text.get(current_end..)?;
+        let next_rest = match next_rest.strip_prefix(' ') {
+            Some(r) => r,
+            None => break, // No space after current word, stop
+        };
+
+        // Check if next word starts with capital
+        let mut chars = next_rest.char_indices();
+        let (_, first_char) = chars.next()?;
+        if !first_char.is_ascii_uppercase() {
+            break; // Next word not capitalized, stop
+        }
+
+        // Find end of this word
+        let next_len = next_rest
+            .char_indices()
+            .find(|(_, c)| !c.is_ascii_alphabetic())
+            .map_or(next_rest.len(), |(offset, _)| offset);
+
+        // Require at least 2 characters
+        if next_len < 2 {
+            break;
+        }
+
+        current_end += 1 + next_len; // space + word
+    }
+
+    Some(current_end)
+}
+
 /// End offset of a `Given Surname` pair, or `None` when no surname follows.
+#[allow(dead_code)]
 fn surname_end(text: &str, given_end: usize) -> Option<usize> {
     let rest = text.get(given_end..)?;
     let rest = rest.strip_prefix(' ')?;
