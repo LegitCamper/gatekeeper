@@ -323,8 +323,8 @@ impl Detector {
 
             // Try to extend name with following capitalized words (surnames, middle names)
             let end = match end_of_name(text, given_end) {
-                Some(e) => e,         // Has following capitalized word(s)
-                None => given_end,    // No following word, just use given name
+                Some(e) => e,      // Has following capitalized word(s)
+                None => given_end, // No following word, just use given name
             };
 
             // Validate the detected name
