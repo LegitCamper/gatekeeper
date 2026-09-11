@@ -368,17 +368,26 @@ fn restore_stream_text(
     token_carry: &mut String,
     mappings: &HashMap<String, String>,
 ) -> String {
-    let mut output = String::with_capacity(text.len());
+    // Prepend any partial token from the previous chunk
+    let full_text = if token_carry.is_empty() {
+        text.to_owned()
+    } else {
+        let mut combined = std::mem::take(token_carry);
+        combined.push_str(text);
+        combined
+    };
+
+    let mut output = String::with_capacity(full_text.len());
     let mut cursor = 0;
 
-    while cursor < text.len() {
-        let Some(relative) = text[cursor..].find('[') else {
-            output.push_str(&text[cursor..]);
+    while cursor < full_text.len() {
+        let Some(relative) = full_text[cursor..].find('[') else {
+            output.push_str(&full_text[cursor..]);
             break;
         };
         let start = cursor + relative;
-        output.push_str(&text[cursor..start]);
-        let tail = &text[start..];
+        output.push_str(&full_text[cursor..start]);
+        let tail = &full_text[start..];
 
         if let Some((token, original)) = mappings
             .iter()

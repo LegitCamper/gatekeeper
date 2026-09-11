@@ -119,6 +119,12 @@ const NAME_DENY: &[&str] = &[
     "East",
     "West",
     "New",
+    // Continents and geographic regions
+    "Africa",
+    "America",
+    "Asia",
+    "Europe",
+    "Australia",
     // Common nouns/words that are also given names
     "Grace",
     "Hope",
