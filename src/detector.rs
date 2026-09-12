@@ -365,7 +365,13 @@ fn validate(kind: Kind, text: &str, start: usize, end: usize) -> Option<(usize, 
     let value = &text[start..end];
     match kind {
         Kind::CreditCard => is_payment_card(value).then_some((start, end)),
-        Kind::Ip => value.parse::<Ipv4Addr>().ok().map(|_| (start, end)),
+        // Loopback and `0.0.0.0` identify nobody; tokenizing them breaks config
+        // and bind-address round-trips.
+        Kind::Ip => value
+            .parse::<Ipv4Addr>()
+            .ok()
+            .filter(|address| !(address.is_loopback() || address.is_unspecified()))
+            .map(|_| (start, end)),
         Kind::Phone => {
             let preceded_by_word = start > 0 && is_word_byte(text.as_bytes()[start - 1]);
             (!preceded_by_word && is_phone(value)).then_some((start, end))
@@ -691,6 +697,23 @@ mod tests {
         assert!(kinds(&detector, "count 12345 items").is_empty());
         // A bare dictionary name without a surname stays untouched.
         assert!(kinds(&detector, "grace under pressure, Grace").is_empty());
+    }
+
+    #[test]
+    fn loopback_and_unspecified_addresses_are_not_redacted() {
+        let detector = Detector::default();
+
+        for address in [Ipv4Addr::UNSPECIFIED, Ipv4Addr::LOCALHOST] {
+            let text = format!("bind {address} port 8100");
+            assert!(kinds(&detector, &text).is_empty(), "redacted {address}");
+        }
+
+        // A routable address is still redacted. TEST-NET-3, never routed.
+        let routable = Ipv4Addr::new(203, 0, 113, 5).to_string();
+        assert_eq!(
+            values(&detector, &format!("host {routable} down")),
+            [routable]
+        );
     }
 
     #[test]
