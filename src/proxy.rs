@@ -140,10 +140,15 @@ async fn proxy(State(state): State<ProxyState>, request: Request<Body>) -> Respo
             .upstream_auth
             .as_ref()
             .is_some_and(|_| is_auth_header(name));
-        if !replaced_by_upstream_auth && !filtered_header(name, &connection_headers) {
+        // Compressed upstream bodies are opaque bytes, so tokens would survive
+        // into the client. Ask for identity and restore in plain text.
+        let compressed = name == header::ACCEPT_ENCODING;
+        if !replaced_by_upstream_auth && !compressed && !filtered_header(name, &connection_headers)
+        {
             upstream = upstream.header(name, value);
         }
     }
+    upstream = upstream.header(header::ACCEPT_ENCODING, "identity");
     if let Some((name, value)) = &state.upstream_auth {
         upstream = upstream.header(name, value);
     }
@@ -636,6 +641,29 @@ mod tests {
         let seen = body_text(router.oneshot(request).await.expect("response")).await;
 
         assert!(seen.contains("client-key"), "{seen}");
+    }
+
+    #[tokio::test]
+    async fn upstream_is_asked_for_identity_encoding() {
+        let upstream = header_echo_upstream().await;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT_ENCODING, "gzip, br")
+            .body(Body::from("{}"))
+            .expect("request built");
+
+        let seen = body_text(
+            router(state(&upstream))
+                .oneshot(request)
+                .await
+                .expect("response"),
+        )
+        .await;
+
+        assert!(seen.contains("identity"), "{seen}");
+        assert!(!seen.contains("gzip"), "{seen}");
     }
 
     #[test]
