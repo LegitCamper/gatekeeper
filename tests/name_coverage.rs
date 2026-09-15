@@ -23,6 +23,10 @@ fn explicit_person_context_covers_reported_names() {
         ("patient Wanjiru Kamau called", "Wanjiru Kamau"),
         ("patient Oluwaseun Adebayo called", "Oluwaseun Adebayo"),
         ("patient Jean-Luc Picard called", "Jean-Luc Picard"),
+        (
+            "patient Ludwig van Beethoven called",
+            "Ludwig van Beethoven",
+        ),
         ("my name is María José García", "María José García"),
         ("my name is alice johnson and I called", "alice johnson"),
         ("My name is Alice.", "Alice"),
@@ -57,6 +61,7 @@ fn reported_name_phrases_are_not_people_without_context() {
         "Sandy Beach Elementary reopened",
         "The name is required",
         "Contact customer support",
+        "patient medical record",
     ] {
         assert!(
             names(text).is_empty(),

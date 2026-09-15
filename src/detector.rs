@@ -120,6 +120,7 @@ const NAME_PHRASE_DENY: &[&str] = &[
     "Sandy Beach",
     "Sandy Beach Elementary",
     "customer support",
+    "medical record",
 ];
 
 /// Capitalized words that are never part of a person's name here, even when the
@@ -198,7 +199,7 @@ impl Default for Detector {
                   | xox[baprs]-[A-Za-z0-9-]{10,}
                   | AIza[0-9A-Za-z_-]{35}
                   | glpat-[A-Za-z0-9_-]{16,}
-                  | eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}
+                  | eyJ[A-Za-z0-9_-]{2,}\.[A-Za-z0-9_-]{2,}\.[A-Za-z0-9_-]{8,}
                 ",
                 )
                 .expect("api key pattern is valid"),
@@ -242,7 +243,7 @@ impl Default for Detector {
                 // The value itself is captured, leaving the label in place.
                 Kind::Ssn,
                 Regex::new(
-                    r"(?i:\b(?:ssn|social security(?: number)?)\b[:# ]{0,3})(\d{3} \d{2} \d{4}|\d{9})\b",
+                    r"(?i:\b(?:ssn|social security(?: number)?)\b[:=# ]{0,3})(\d{3} \d{2} \d{4}|\d{9})\b",
                 )
                 .expect("contextual ssn pattern is valid"),
             ),
@@ -313,6 +314,16 @@ impl Default for Detector {
                     r"(?i:\b(?:my name is\b|name:|(?:mr|mrs|ms|dr)\.?) +)([\p{L}][\p{L}'’-]*)",
                 )
                 .expect("single-word name identity pattern is valid"),
+            ),
+            (
+                // Common lowercase surname particles belong to the surrounding
+                // capitalized name, not a truncated given/particle pair.
+                Kind::Name,
+                Regex::new(&format!(
+                    r"(?i:\b(?:{})\b)[:,]? +(\p{{Lu}}[\p{{L}}'’-]* +(?:van|von|de|del|da|di|du|la|le) +\p{{Lu}}[\p{{L}}'’-]*)",
+                    NAME_TRIGGERS.join("|")
+                ))
+                .expect("name particle trigger pattern is valid"),
             ),
             (
                 // General triggers may carry a three-word title-cased name. Keep

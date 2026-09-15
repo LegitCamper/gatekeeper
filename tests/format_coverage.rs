@@ -25,6 +25,10 @@ fn newly_covered_secret_formats_are_detected() {
             Kind::ApiKey,
         ),
         (
+            "eyJhbGciOiJIUzI1NiJ9.e30.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+            Kind::ApiKey,
+        ),
+        (
             "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
             Kind::ApiKey,
         ),
@@ -50,6 +54,7 @@ fn unformatted_ssn_is_detected_with_context() {
     for text in [
         "ssn 123456789 on file",
         "SSN: 123456789",
+        "SSN=123456789",
         "ssn 123 45 6789 on file",
         "social security number 123456789",
         "Social Security: 123-45-6789",

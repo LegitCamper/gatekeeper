@@ -277,6 +277,11 @@ fn write_destination(tokens: &[String], index: usize) -> Option<&'static str> {
         .rposition(|token| BOUNDARY.contains(&token.as_str()))
         .map_or(0, |position| position + 1);
     let command = tokens.get(start)?;
+    if command == "dd" {
+        return tokens[index]
+            .strip_prefix("of=")
+            .and_then(protected_segment);
+    }
     let sink = SINK_COMMANDS.iter().any(|c| c == command);
     let copy_like = sink
         || MOVE_COMMANDS.iter().any(|c| c == command)
@@ -364,6 +369,7 @@ mod tests {
             "cat .en?v",
             "cat [.]env",
             "cat .[e]nv",
+            "cat .en[v]",
             "x=n; cat .e${x}v",
             "dd if=.env",
         ] {
@@ -425,6 +431,7 @@ mod tests {
             "tee .env < input",
             "truncate -s 0 .env",
             "printf 'A=1\\n' > app/.env",
+            "dd if=/dev/zero of=.env count=0",
         ] {
             assert!(
                 !blocked(invocation("Bash", json!({"command": command}))),
