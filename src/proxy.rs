@@ -135,6 +135,12 @@ async fn proxy(State(state): State<ProxyState>, request: Request<Body>) -> Respo
     // parse a JSON body whatever the header claims, so a client that sends JSON
     // as `text/plain` — or with no content-type at all — would otherwise hand
     // the upstream unredacted PII.
+    // A request with no body has nothing to redact, so it is forwarded exactly as
+    // it arrived. This is the whole class of non-agent calls — `GET /v1/models`,
+    // `/api/tags`, `/api/version`, `DELETE` — which stay transparent. SDKs send
+    // `content-type: application/json` on bodiless requests too, so an absent body
+    // must never be judged against a header that only describes bodies.
+    let body_is_blank = body.iter().all(u8::is_ascii_whitespace);
     let (outgoing_body, mappings) = match serde_json::from_slice::<Value>(&body) {
         Ok(mut value) => {
             // Reads of `.env` and key material must never reach the provider, but
@@ -165,7 +171,7 @@ async fn proxy(State(state): State<ProxyState>, request: Request<Body>) -> Respo
             }
         }
         // A body that claims to be JSON but is not stays a client error.
-        Err(error) if content_type.as_deref().is_some_and(is_json) => {
+        Err(error) if !body_is_blank && content_type.as_deref().is_some_and(is_json) => {
             return json_error(
                 StatusCode::BAD_REQUEST,
                 format!("invalid JSON request body: {error}"),
@@ -1486,6 +1492,49 @@ mod tests {
             .expect("proxied response");
 
         assert_eq!(body_text(response).await, PROMPT);
+    }
+
+    /// Both SDK families put `content-type: application/json` on every request,
+    /// including the bodiless `GET /v1/models`. Grading an absent body against that
+    /// header answered 400 before the model list was ever fetched upstream.
+    #[tokio::test]
+    async fn a_bodiless_request_with_a_json_content_type_is_forwarded() {
+        const MODELS: &str = r#"{"object":"list","data":[{"id":"gemma3:latest"}]}"#;
+        let target = fixed_upstream("application/json", MODELS).await;
+
+        for body in ["", "\n "] {
+            let request = Request::builder()
+                .uri("/v1/models")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .expect("request built");
+            let response = router(state(&target))
+                .oneshot(request)
+                .await
+                .expect("response");
+
+            assert_eq!(response.status(), StatusCode::OK, "for body {body:?}");
+            assert_eq!(body_text(response).await, MODELS);
+        }
+    }
+
+    /// The 400 stays for a body that is actually present and actually broken.
+    #[tokio::test]
+    async fn a_malformed_json_body_is_still_a_client_error() {
+        let target = echo_upstream("application/json").await;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"messages": ["unclosed"#))
+            .expect("request built");
+
+        let response = router(state(&target))
+            .oneshot(request)
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
