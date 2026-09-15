@@ -72,10 +72,10 @@ const BOUNDARY: &[&str] = &[";", "|", REDIRECT];
 pub fn protected_file_read(value: &Value) -> Option<&'static str> {
     match value {
         Value::Object(map) => {
-            if is_invocation(map) {
-                if let Some(hit) = invocation_read(map) {
-                    return Some(hit);
-                }
+            if is_invocation(map)
+                && let Some(hit) = invocation_read(map)
+            {
+                return Some(hit);
             }
             map.values().find_map(protected_file_read)
         }

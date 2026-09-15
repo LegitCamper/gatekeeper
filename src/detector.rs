@@ -659,30 +659,30 @@ impl Restorer {
             // Either way the run has to start on a boundary, so a digest sitting
             // inside a longer hex value stays part of that value.
             let on_boundary = !(cursor > 0 && bytes[cursor - 1].is_ascii_alphanumeric());
-            if let (true, Some((digest, digest_end))) = (on_boundary, found) {
-                if let Some(Some(original)) = self.digests.get(&digest) {
-                    let decorated = decoration_start(&full_text, cursor);
-                    let bracketed = cursor > 0
-                        && bytes[cursor - 1] == b'['
-                        && bytes.get(digest_end) == Some(&b']');
-                    let start = decorated.or_else(|| bracketed.then(|| cursor - 1));
-                    if let Some(start) = start {
-                        let decoration = &full_text[start..cursor];
-                        if output.ends_with(decoration) {
-                            output.truncate(output.len() - decoration.len());
-                        }
+            if on_boundary
+                && let Some((digest, digest_end)) = found
+                && let Some(Some(original)) = self.digests.get(&digest)
+            {
+                let decorated = decoration_start(&full_text, cursor);
+                let bracketed =
+                    cursor > 0 && bytes[cursor - 1] == b'[' && bytes.get(digest_end) == Some(&b']');
+                let start = decorated.or_else(|| bracketed.then(|| cursor - 1));
+                if let Some(start) = start {
+                    let decoration = &full_text[start..cursor];
+                    if output.ends_with(decoration) {
+                        output.truncate(output.len() - decoration.len());
                     }
-                    output.push_str(original);
-                    cursor = digest_end;
-                    if start.is_some() {
-                        if bytes.get(cursor) == Some(&b']') {
-                            cursor += 1;
-                        } else if cursor == full_text.len() {
-                            carry.skip_closing_bracket = true;
-                        }
-                    }
-                    continue;
                 }
+                output.push_str(original);
+                cursor = digest_end;
+                if start.is_some() {
+                    if bytes.get(cursor) == Some(&b']') {
+                        cursor += 1;
+                    } else if cursor == full_text.len() {
+                        carry.skip_closing_bracket = true;
+                    }
+                }
+                continue;
             }
 
             let next = full_text[cursor..]
@@ -1045,7 +1045,7 @@ fn is_payment_card(value: &str) -> bool {
             }
         })
         .sum();
-    sum % 10 == 0
+    sum.is_multiple_of(10)
 }
 
 /// Phone-number shape regexes for values the `phonenumber` metadata rejects.
