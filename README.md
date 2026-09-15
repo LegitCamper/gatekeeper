@@ -2,6 +2,70 @@
 
 Gatekeeper is a Rust/Axum reverse proxy that removes sensitive values before LLM API requests reach an upstream provider and restores those values in that request's response.
 
+```
+   agent / SDK             Gatekeeper :8080            upstream provider
+   any LLM client     authless, stateless, 1 hop    Anthropic / OpenAI / ...
+
+     |                        |                             |
+     | --- REQUEST ---------> | ---- tokens, no PII ----->  |
+     |                        |                             |
+     | < -- RESPONSE -------- | < -- originals restored --  |
+     |                        |                             |
+
+ ROUTE
+   /health, /healthz .......... {"status":"ok"}  (local)
+   /scan ...................... {matches, anonymized}  (local)
+   anything else .............. proxy()
+
+ proxy() - outbound, in order:
+
+   1  body > GATEKEEPER_MAX_BODY_BYTES ................. 413
+   2  no body ................... forward untouched
+      (GET /v1/models, /api/tags, DELETE: no allowlist,
+       no rewriting - SDKs send a JSON content-type on
+       these too, and an absent body is not malformed)
+   3  JSON parse
+        ok ..................... step 4
+        claims JSON, broken .... 400
+        not JSON (binary, form, prose) ... passthrough, step 8
+   4  tool guard - WITHHOLD, never refuse
+        read of .env / *.pem / *.key ... result replaced by
+          a "ask the user" notice, the call still forwarded
+        cp .env /tmp/x ... legitimate, but the copy is tracked:
+          a later read of that path is blanked too
+   5  detector - PII + secrets -> tokens
+        API_KEY EMAIL CARD SSN IP DOB PHONE ADDRESS NAME
+        PATH CUSTOM
+        "[EMAIL_a1b2c3d4e5f6]"  <-  a real address, a phone, a name
+        mapping lives for this request only, then is dropped
+   6  headers - hop-by-hop dropped, client accept-encoding
+      dropped, upstream asked for identity
+   7  auth - UPSTREAM_API_KEY replaces the client credential;
+      unset, the client's own header is forwarded
+   8  same path + query onto TARGET_URL - no schema
+      translation, no retries, redirects not followed
+
+ upstream - RESPONSE back:
+
+   9  status + headers forwarded; a 3xx handed to the caller
+  10  restore tokens, THIS request's digests only
+        JSON | SSE | NDJSON | plain text
+        token split across chunks -> carried, then stitched
+        model-invented text and foreign tokens -> left alone
+        responses are never scanned for new secrets
+  11  no tokens ............ byte-for-byte passthrough
+      upstream compressed .. warn, bytes handed back as-is
+      undecodable body ..... 502
+
+ what can make Gatekeeper answer by itself:
+   413  oversized request, or oversized JSON response whose
+        tokens could not be restored
+   400  body declares JSON but does not parse
+   502  unreachable upstream, or undecodable upstream body
+   no policy denial exists: a protected read is stripped,
+   not rejected
+```
+
 ## Core behavior
 
 - Detects and tokenizes common PII and secrets in JSON request strings. See [Secret coverage](#secret-coverage) for the key and credential formats recognized.
