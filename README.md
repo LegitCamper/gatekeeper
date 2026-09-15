@@ -10,7 +10,7 @@ Gatekeeper is a Rust/Axum reverse proxy that removes sensitive values before LLM
 - Redacts outbound requests only. Response text is never scanned, so a name, number, or address the model invents reaches the client exactly as written.
 - Redacts home-directory paths down to the account name: `/home/<user>`, `/var/home/<user>`, and `/Users/<user>` become one `PATH` token, so the username goes and the rest of the path (`/projects/gatekeeper/src`) stays readable for the model and restorable for the client.
 - Redacts whatever you list in `GATEKEEPER_REDACT`, plus optionally this machine's login and host name — see [Custom redaction](#custom-redaction).
-- Denies outbound tool calls that read `.env`, `.pem`, or `.key` files, so private configuration and key material cannot be handed to a provider. Writes and `.env.example` are unaffected. See [`.env` read guard](#env-read-guard).
+- Withholds the result of outbound tool calls that read `.env`, `.pem`, or `.key` files, so private configuration and key material cannot be handed to a provider — while forwarding the request, so the agent keeps working. Writes and `.env.example` are unaffected. See [`.env` read guard](#env-read-guard).
 - Restores tokens in JSON, Server-Sent Event, and other streamed responses, including tokens split across chunks. Restoration keys on the request-local 12-hex digest, so common model changes to token prefixes, brackets, separators, or hex case still restore the original value.
 - Proxies provider headers and payloads without translating Anthropic/OpenAI schemas.
 - Never requires Redis or another external state service.
@@ -19,42 +19,72 @@ Token mappings are scoped to the request that created them: they live for that r
 
 ## `.env` read guard
 
-Gatekeeper inspects outbound tool-call invocations and returns `403` for any that
-**read** a protected file, so a file's secrets can never ride a request to the
-provider:
+Gatekeeper inspects outbound tool-call invocations and **withholds the result** of
+any that **read** a protected file, so a file's secrets can never ride a request to
+the provider:
 
 - Protected: the exact basename `.env`, plus any `.pem` or `.key` file. Add more
   to `PROTECTED_BASENAMES` / `PROTECTED_EXTENSIONS` in `src/toolguard.rs`.
 - Not protected: `.env.example`, `.env.local`, any other `.env.*` variant, and
   `.pub` public keys, which are meant to circulate.
 - Writes pass. An agent may create or overwrite these files, so the usual
-  `cp .env.example .env` setup works. A command that _reads_ a protected file to
-  copy or move it elsewhere (`cp .env /tmp/x`) is denied — relocating a secret is
-  how the guard would otherwise be stepped around.
+  `cp .env.example .env` setup works.
+- **A copy of a protected file stays protected.** `cp .env /tmp/local.env` is a
+  legitimate tool call and is forwarded untouched — but the guard records where the
+  secret landed and withholds reads of *that* path too, so `cat /tmp/local.env` on a
+  later turn is stripped like the original. Copy-of-a-copy chains resolve, since
+  every hop is in the request history.
 - Checked for every tool, not just file tools: structured arguments (`input`,
-  `arguments`, `path`, `file_path`) and shell `command` strings both count, and
-  unknown tools are denied on a match.
-- The guard only reads outbound requests. Responses and tool results are never
-  blocked or rewritten, and prose mentioning `.env` outside an invocation is left
-  alone. The `403` body names the protected file's basename and nothing else — no
-  path, no request body.
+  `arguments`, `path`, `file_path`) and shell `command` strings both count.
+- The request is forwarded, not refused. A read has already run on your machine by
+  the time its contents ride back outbound, and clients resend conversation history
+  every turn — so a refusal stops the agent *and* every later turn of that session
+  without un-reading the file. Withholding the payload blocks the one thing that
+  matters (the provider seeing the file) and leaves the agent working. The result
+  becomes:
 
-Gatekeeper's own refusals use the provider error shape, so a client or a model
-relaying the failure shows a reason instead of an opaque transport error:
+  ```text
+  [gatekeeper withheld the contents of .env. Do not retry the read or reach for
+  another tool: this proxy never forwards them to the model provider. Ask the
+  user for the value you need.]
+  ```
+
+  The wording tells the model to ask rather than route around, which is what a
+  silent blank would invite.
+- Correlated by call id (`tool_use_id`, `tool_call_id`, `call_id`), so only the
+  result answering that read is blanked: unrelated tool output, prose mentioning
+  `.env`, and the read invocation itself all survive untouched. A read whose result
+  is not in the body cannot be stripped and is logged as `unpaired` at `warn` level,
+  where PII redaction is the remaining net.
+- Shell expansions are resolved, not refused. `x=n; cat .e${x}v` names `.env` once
+  the command's own `x=n` is substituted, so it is caught. A value inherited from
+  the parent shell (`${HOME}`, `$()`) cannot be resolved from the request alone;
+  those spellings are **not** blocked, and PII redaction is the net. The earlier
+  fail-closed rule that blocked *any* shell call containing `$(`, `${`, or a
+  backtick was removed — it stopped `echo "built $(date)"` and similar ordinary
+  commands, which is the over-blocking the forward-only design is meant to avoid.
+- The guard reads outbound requests only. Provider responses are never blocked or
+  rewritten.
+
+Anything Gatekeeper does reject is still shaped like a provider error, so a client
+or a model relaying the failure shows a reason instead of an opaque transport error:
 
 ```json
 {
   "type": "error",
   "error": {
-    "type": "gatekeeper_security_error",
-    "message": "Gatekeeper blocked this request over security concerns: reading .env would send its contents to the model provider"
+    "type": "gateway_error",
+    "message": "upstream request failed: connection refused"
   }
 }
 ```
 
-`error.type` is `gatekeeper_security_error` for a policy refusal and
+`error.type` is `gatekeeper_security_error` when a size limit protects redaction and
 `gateway_error` for everything else Gatekeeper rejects itself (oversized body,
-bad request JSON, unreachable upstream), so callers can branch on the difference.
+unreachable upstream, undecodable upstream response). Those cannot be answered with a
+pass-through: an oversized body cannot be parsed, so it cannot be redacted, and a
+transport failure has no upstream answer to forward. They are `413`/`502`, not policy
+denials — no security control on the agent path throws any more.
 
 ## Custom redaction
 

@@ -126,16 +126,18 @@ async fn proxy(State(state): State<ProxyState>, request: Request<Body>) -> Respo
     // the upstream unredacted PII.
     let (outgoing_body, mappings) = match serde_json::from_slice::<Value>(&body) {
         Ok(mut value) => {
-            // Reads of `.env` and key material must never reach the provider: the
-            // file contents ride this very request onward. Writes pass untouched.
-            if let Some(name) = toolguard::protected_file_read(&value) {
-                tracing::warn!(file = name, "blocked tool call reading a protected file");
-                return security_error(
-                    StatusCode::FORBIDDEN,
-                    format!(
-                        "Gatekeeper blocked this request over security concerns: reading {name} \
-                         would send its contents to the model provider"
-                    ),
+            // Reads of `.env` and key material must never reach the provider, but
+            // the read has already run on the client's machine by the time its
+            // contents ride back outbound — refusing the request stops the agent
+            // without un-reading the file, and since clients resend history every
+            // turn it would stop that session forever. Withhold the payload and
+            // forward, so the guard holds and the agent keeps working.
+            let withheld = toolguard::withhold_protected_reads(&mut value);
+            if !withheld.blanked.is_empty() || !withheld.unpaired.is_empty() {
+                tracing::warn!(
+                    blanked = ?withheld.blanked,
+                    unpaired = ?withheld.unpaired,
+                    "withheld protected file contents from an outbound request"
                 );
             }
             let mut mappings = HashMap::new();
@@ -1152,8 +1154,51 @@ mod tests {
         format!("http://{address}")
     }
 
+    /// A read already ran on the client's machine, so refusing the request would
+    /// only stop the agent — and, because history is resent, every later turn of
+    /// that session. The file's contents are stripped instead and the request
+    /// goes through: the provider never sees them, the agent keeps working.
     #[tokio::test]
-    async fn a_tool_call_reading_dotenv_never_reaches_the_upstream() {
+    async fn contents_of_a_protected_read_never_reach_the_upstream() {
+        let upstream = echo_upstream("application/json").await;
+        let router = router(state(&upstream));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({"messages": [
+                    {"role": "assistant", "content": [{
+                        "type": "tool_use", "id": "toolu_1", "name": "Read",
+                        "input": {"file_path": "/app/.env"}
+                    }]},
+                    {"role": "user", "content": [{
+                        "type": "tool_result", "tool_use_id": "toolu_1",
+                        "content": "DATABASE_URL=postgres://admin:ZEBRAqzx3@db:5432/app"
+                    }]}
+                ]})
+                .to_string(),
+            ))
+            .expect("request built");
+
+        let response = router.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let seen = body_text(response).await;
+        // The secret is gone and the model is told why, so it asks the user
+        // instead of reaching for another tool that names the same file.
+        assert!(!seen.contains("ZEBRAqzx3"), "{seen}");
+        assert!(seen.contains("withheld the contents of .env"), "{seen}");
+        assert!(seen.contains("Ask the user"), "{seen}");
+        // The conversation itself stays intact: history must survive the strip.
+        assert!(seen.contains("/app/.env"), "{seen}");
+        assert!(seen.contains("tool_use"), "{seen}");
+    }
+
+    /// A read in history with no result to strip still must not fail the request,
+    /// or one old turn would poison the whole session.
+    #[tokio::test]
+    async fn a_protected_read_with_no_result_is_forwarded() {
         let upstream = echo_upstream("application/json").await;
         let router = router(state(&upstream));
         let request = Request::builder()
@@ -1162,23 +1207,15 @@ mod tests {
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(
                 json!({"messages": [{"role": "assistant", "content": [
-                    {"type": "tool_use", "name": "Read", "input": {"file_path": "/app/.env"}}
+                    {"type": "tool_use", "id": "toolu_1", "name": "Read",
+                     "input": {"file_path": "/app/.env"}}
                 ]}]})
                 .to_string(),
             ))
             .expect("request built");
 
         let response = router.oneshot(request).await.expect("response");
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-
-        // The deny is generic: neither the path nor the request body echoes back,
-        // and it says who refused so a client cannot mistake it for the provider.
-        let seen = body_text(response).await;
-        assert!(seen.contains("Gatekeeper"), "{seen}");
-        assert!(seen.contains("security"), "{seen}");
-        assert!(seen.contains("gatekeeper_security_error"), "{seen}");
-        assert!(!seen.contains("/app/"), "{seen}");
-        assert!(!seen.contains("tool_use"), "{seen}");
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
