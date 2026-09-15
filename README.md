@@ -1,6 +1,6 @@
 # Gatekeeper
 
-Gatekeeper is a Rust/Axum reverse proxy that removes sensitive values before LLM API requests reach an upstream provider and restores those values in that request's response. It is a core reimplementation of AgentVeil with no external state service.
+Gatekeeper is a Rust/Axum reverse proxy that removes sensitive values before LLM API requests reach an upstream provider and restores those values in that request's response.
 
 ## Core behavior
 
@@ -108,6 +108,6 @@ cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo bench --bench detector
 ```
 
-## Deferred AgentVeil parity
+## Inspiration
 
-This first release focuses on the requested high-throughput PII proxy. API-key administration, role-based masking, rate limiting, multi-provider routing/fallback, prompt-injection guardrails, webhooks, compliance/auditing, media OCR, CLI commands, and SDK packages remain follow-up work.
+Gatekeeper was inspired by AgentVeil but has since evolved into an independent project.

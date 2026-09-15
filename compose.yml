@@ -1,0 +1,30 @@
+services:
+  gatekeeper:
+    # image: ghcr.io/legitcamper/gatekeeper:latest
+    build: .
+    container_name: gatekeeper
+    # env_file: .env
+    environment:
+      TARGET_URL=http://ollama:11434
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama:/root/.ollama
+    restart: unless-stopped
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+volumes:
+  ollama:

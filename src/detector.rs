@@ -587,7 +587,7 @@ impl Restorer {
             // Either way the run has to start on a boundary, so a digest sitting
             // inside a longer hex value stays part of that value.
             let on_boundary = !(cursor > 0 && bytes[cursor - 1].is_ascii_alphanumeric());
-            if on_boundary && let Some((digest, digest_end)) = found {
+            if let (true, Some((digest, digest_end))) = (on_boundary, found) {
                 if let Some(Some(original)) = self.digests.get(&digest) {
                     let decorated = decoration_start(&full_text, cursor);
                     let bracketed = cursor > 0
