@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 use url::{Position, Url};
 
 use crate::detector::{Detector, RestoreCarry, Restorer};
+use crate::toolguard;
 
 #[derive(Clone)]
 pub struct ProxyState {
@@ -109,15 +110,33 @@ async fn proxy(State(state): State<ProxyState>, request: Request<Body>) -> Respo
     // response to the request that created it, so one client's values can never
     // be spliced into another's response, and model-invented text is untouched.
     let (outgoing_body, mappings) = if content_type.as_deref().is_some_and(is_json) {
-        match anonymize_json_body(&body, &state.detector) {
-            Ok((body, mappings)) => {
-                tracing::debug!(count = mappings.len(), "anonymized request");
-                (body, mappings)
-            }
+        let mut value: Value = match serde_json::from_slice(&body) {
+            Ok(value) => value,
             Err(error) => {
                 return json_error(
                     StatusCode::BAD_REQUEST,
                     format!("invalid JSON request body: {error}"),
+                );
+            }
+        };
+        // Reads of `.env` and key material must never reach the provider: the
+        // file contents ride this very request onward. Writes pass untouched.
+        if let Some(name) = toolguard::protected_file_read(&value) {
+            tracing::warn!(file = name, "blocked tool call reading a protected file");
+            return json_error(
+                StatusCode::FORBIDDEN,
+                format!("read access to {name} is not allowed"),
+            );
+        }
+        let mut mappings = HashMap::new();
+        anonymize_json(&mut value, &state.detector, &mut mappings);
+        tracing::debug!(count = mappings.len(), "anonymized request");
+        match serde_json::to_vec(&value) {
+            Ok(encoded) => (Bytes::from(encoded), mappings),
+            Err(error) => {
+                return json_error(
+                    StatusCode::BAD_GATEWAY,
+                    format!("failed to encode anonymized request: {error}"),
                 );
             }
         }
@@ -244,6 +263,9 @@ async fn upstream_response(
     }
 }
 
+/// Parse-and-anonymize helper, kept for direct unit testing of the JSON walk;
+/// `proxy()` inlines the same steps so the tool guard can see the parsed value.
+#[cfg(test)]
 fn anonymize_json_body(
     body: &[u8],
     detector: &Detector,
@@ -983,6 +1005,55 @@ mod tests {
         });
 
         format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_reading_dotenv_never_reaches_the_upstream() {
+        let upstream = echo_upstream("application/json").await;
+        let router = router(state(&upstream));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({"messages": [{"role": "assistant", "content": [
+                    {"type": "tool_use", "name": "Read", "input": {"file_path": "/app/.env"}}
+                ]}]})
+                .to_string(),
+            ))
+            .expect("request built");
+
+        let response = router.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // The deny is generic: neither the path nor the request body echoes back.
+        let seen = body_text(response).await;
+        assert!(seen.contains("not allowed"), "{seen}");
+        assert!(!seen.contains("/app/"), "{seen}");
+        assert!(!seen.contains("tool_use"), "{seen}");
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_writing_dotenv_and_reading_public_keys_is_forwarded() {
+        let upstream = echo_upstream("application/json").await;
+        let router = router(state(&upstream));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({"messages": [{"role": "assistant", "content": [
+                    {"type": "tool_use", "name": "Bash", "input": {"command": "cp .env.example .env"}},
+                    {"type": "tool_use", "name": "Read", "input": {"file_path": "id_ed25519.pub"}}
+                ]}]})
+                .to_string(),
+            ))
+            .expect("request built");
+
+        let seen = body_text(router.oneshot(request).await.expect("response")).await;
+
+        assert!(seen.contains(".env.example"), "{seen}");
+        assert!(seen.contains("id_ed25519.pub"), "{seen}");
     }
 
     #[tokio::test]

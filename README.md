@@ -8,11 +8,33 @@ Gatekeeper is a Rust/Axum reverse proxy that removes sensitive values before LLM
 - Handles bare 10- and 11-digit, leading-`+`, dashed/dotted/parenthesized, international, and Vietnamese phone formats. Placeholder numbers such as `000-000-0000` are redacted too, so an undialable number in a prompt is still removed.
 - Detects person names from a ~19k-entry multi-origin given-name dictionary, plus any capitalized pair after a trigger word (`contact`, `cc:`, `regards,`, `Mr.`, `my name is`). Entries colliding with ordinary English words are excluded, and calendar/direction words are denied, so capitalized technical prose ("New York", "Redis Cluster", "Docker Compose") is left intact.
 - Redacts outbound requests only. Response text is never scanned, so a name, number, or address the model invents reaches the client exactly as written.
+- Denies outbound tool calls that read `.env`, `.pem`, or `.key` files, so private configuration and key material cannot be handed to a provider. Writes and `.env.example` are unaffected. See [`.env` read guard](#env-read-guard).
 - Restores tokens in JSON, Server-Sent Event, and other streamed responses, including tokens split across chunks. Restoration keys on the request-local 12-hex digest, so common model changes to token prefixes, brackets, separators, or hex case still restore the original value.
 - Proxies provider headers and payloads without translating Anthropic/OpenAI schemas.
 - Never requires Redis or another external state service.
 
 Token mappings are scoped to the request that created them: they live for that request's response and are dropped when it ends. Restoration recognizes the digest even when the model changes or removes token decoration, but only digests owned by that request can resolve. A token or digest from another request stays opaque, so one client's values can never be spliced into another's, and unrelated model output passes through untouched. Because the client receives restored text and sends it back on the next turn, multi-turn conversations need no retained state and no session header.
+
+## `.env` read guard
+
+Gatekeeper inspects outbound tool-call invocations and returns `403` for any that
+**read** a protected file, so a file's secrets can never ride a request to the
+provider:
+
+- Protected: the exact basename `.env`, plus any `.pem` or `.key` file. Add more
+  to `PROTECTED_BASENAMES` / `PROTECTED_EXTENSIONS` in `src/toolguard.rs`.
+- Not protected: `.env.example`, `.env.local`, any other `.env.*` variant, and
+  `.pub` public keys, which are meant to circulate.
+- Writes pass. An agent may create or overwrite these files, so the usual
+  `cp .env.example .env` setup works. A command that _reads_ a protected file to
+  copy or move it elsewhere (`cp .env /tmp/x`) is denied — relocating a secret is
+  how the guard would otherwise be stepped around.
+- Checked for every tool, not just file tools: structured arguments (`input`,
+  `arguments`, `path`, `file_path`) and shell `command` strings both count, and
+  unknown tools are denied on a match.
+- The guard only reads outbound requests. Responses and tool results are never
+  blocked or rewritten, and prose mentioning `.env` outside an invocation is left
+  alone. The `403` body names the protected file and nothing else.
 
 ## Run
 
@@ -38,7 +60,7 @@ For Compose, copy the environment template, set a reachable upstream, then start
 
 ```bash
 cp .env.example .env
-docker compose -f compose.example.yml up -d
+docker compose -f compose.yml up -d
 ```
 
 Inside a container, `localhost` refers to that container. Set `TARGET_URL` to an upstream Compose service name such as `http://ollama:11434`, or another host reachable from the container. If the GHCR package is private, authenticate first with `docker login ghcr.io`.
