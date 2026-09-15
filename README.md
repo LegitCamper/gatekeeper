@@ -4,7 +4,7 @@ Gatekeeper is a Rust/Axum reverse proxy that removes sensitive values before LLM
 
 ## Core behavior
 
-- Detects and tokenizes common PII and secrets in JSON request strings.
+- Detects and tokenizes common PII and secrets in JSON request strings. See [Secret coverage](#secret-coverage) for the key and credential formats recognized.
 - Handles bare 10- and 11-digit, leading-`+`, dashed/dotted/parenthesized, international, and Vietnamese phone formats. Placeholder numbers such as `000-000-0000` are redacted too, so an undialable number in a prompt is still removed.
 - Detects person names from a ~19k-entry multi-origin given-name dictionary, plus any capitalized pair after a trigger word (`contact`, `cc:`, `regards,`, `Mr.`, `my name is`). Entries colliding with ordinary English words are excluded, and calendar/direction words are denied, so capitalized technical prose ("New York", "Redis Cluster", "Docker Compose") is left intact.
 - Redacts outbound requests only. Response text is never scanned, so a name, number, or address the model invents reaches the client exactly as written.
@@ -16,6 +16,67 @@ Gatekeeper is a Rust/Axum reverse proxy that removes sensitive values before LLM
 - Never requires Redis or another external state service.
 
 Token mappings are scoped to the request that created them: they live for that request's response and are dropped when it ends. Restoration recognizes the digest even when the model changes or removes token decoration, but only digests owned by that request can resolve. A token or digest from another request stays opaque, so one client's values can never be spliced into another's, and unrelated model output passes through untouched. Because the client receives restored text and sends it back on the next turn, multi-turn conversations need no retained state and no session header.
+
+## Secret coverage
+
+Keys and credentials are found by their own shape, wherever they appear —
+a prompt, a pasted config, a file the agent read. This is independent of the
+[`.env` read guard](#env-read-guard), which works on file names: a key in
+`notes.txt` or a heredoc is caught here even though that file is unprotected.
+
+**Vendor-prefixed keys.** Recognized on prefix and length, so no label is
+needed:
+
+| Vendor | Forms |
+| --- | --- |
+| Anthropic / OpenAI | `sk-ant-…`, `sk-…` |
+| AWS | `AKIA`, `ASIA`, `AGPA`, `AIDA`, `AROA`, `ANPA`, `ANVA` + 16 |
+| GitHub | `ghp_`, `gho_`, `ghs_`, `ghu_`, `ghr_`, `github_pat_` |
+| Generic PAT | `pat_` + 20 alphanumerics |
+| GitLab | `glpat-` |
+| Slack | `xoxb-`, `xoxa-`, `xoxp-`, `xoxr-`, `xoxs-` |
+| Google | `AIza` + 35 |
+| Stripe | `sk_live_`, `sk_test_`, `rk_live_`, `rk_test_` |
+| Shopify | `shpat_`, `shpca_`, `shppa_`, `shpss_` |
+| npm | `npm_` + 36 |
+| Hugging Face | `hf_` |
+| DigitalOcean | `dop_v1_` |
+| SendGrid | `SG.…….…` |
+| Square | `sq0atp-`, `sq0csp-` |
+| Databricks | `dapi` + 32 hex |
+| PyPI | `pypi-AgEIcHlwaS5vcmc…` |
+| JWT | `eyJ….….…` |
+
+**PEM private keys.** Matched on content, not file name: any
+`-----BEGIN … PRIVATE KEY-----` through its matching `-----END-----` is taken
+as one value, up to 8 KiB. RSA, EC, OPENSSH, PKCS#8, and unlabeled blocks all
+match, so key material in `backup.txt`, `server.pem.bak`, or a shell heredoc is
+removed even though those names mean nothing to the file guard. A lone armor
+line is matched on its own, so a truncated or quoted block is still caught.
+
+**Labeled secrets.** A password or house-built token has no prefix and no
+shape, so the label is what finds it. After `password`, `passwd`, `secret`,
+`api_key` / `api-key` / `apikey`, `auth_token`, `access_token`,
+`refresh_token`, `client_secret`, `private_key`, or `bearer` — followed by
+`:` or `=` — the value is tokenized and the label stays readable.
+
+**AWS secret access keys** need their label too (`aws_secret_access_key = …`).
+Forty base64 characters is too ordinary a shape to redact unlabeled.
+
+What this deliberately does not catch:
+
+- Prose. `rotate the password before Friday` has no separator and no value.
+- Environment references and placeholders: `api-key: $ANTHROPIC_API_KEY` and
+  `api_key: <your-key-here>` name no secret, so both pass through.
+- Type annotations: `private_key: Option<String>` is code, not a credential.
+  A bare PascalCase type wider than eight characters (`client_secret:
+  SecretString`) is still tokenized — it round-trips intact, so the cost is
+  model readability rather than correctness.
+- Unlabeled high-entropy strings. A bare 32-character value with no prefix and
+  no label is indistinguishable from a hash, an ID, or a commit SHA.
+
+Everything here lands in the `API_KEY` token class and round-trips like any
+other value: the provider sees a token, the client sees the original bytes.
 
 ## `.env` read guard
 

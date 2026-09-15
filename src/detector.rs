@@ -208,16 +208,78 @@ impl Default for Detector {
                     r"(?x)
                     sk-ant-[A-Za-z0-9_-]{10,}
                   | sk-[A-Za-z0-9_-]{16,}
-                  | AKIA[0-9A-Z]{16}
+                  | A(?:KIA|SIA|GPA|IDA|ROA|NPA|NVA)[0-9A-Z]{16}
                   | gh[posur]_[A-Za-z0-9]{20,}
                   | github_pat_[A-Za-z0-9_]{20,}
                   | xox[baprs]-[A-Za-z0-9-]{10,}
                   | AIza[0-9A-Za-z_-]{35}
                   | glpat-[A-Za-z0-9_-]{16,}
+                  | [sr]k_(?:live|test)_[A-Za-z0-9]{16,}
+                  | shp(?:at|ca|pa|ss)_[A-Za-z0-9]{32}
+                  | npm_[A-Za-z0-9]{36}
+                  | hf_[A-Za-z0-9]{30,}
+                  | dop_v1_[A-Za-z0-9]{40,}
+                  | SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}
+                  | sq0(?:atp|csp)-[A-Za-z0-9_-]{20,}
+                  | dapi[0-9a-f]{32}
+                  | pypi-AgEIcHlwaS5vcmc[A-Za-z0-9_-]{16,}
                   | eyJ[A-Za-z0-9_-]{2,}\.[A-Za-z0-9_-]{2,}\.[A-Za-z0-9_-]{8,}
                 ",
                 )
                 .expect("api key pattern is valid"),
+            ),
+            (
+                // Generic `pat_` personal access tokens. The tail deliberately
+                // excludes `_`: a token is alphanumeric, while `pat_matcher_state`
+                // and other snake_case identifiers are not, so ordinary source
+                // text keeps its names.
+                Kind::ApiKey,
+                Regex::new(r"\bpat_[A-Za-z0-9]{20,}").expect("pat token pattern is valid"),
+            ),
+            (
+                // PEM private keys, matched on content rather than file name, so
+                // key material pasted into a prompt or read out of `backup.txt`,
+                // `server.pem.bak`, or any other extension the `.env` guard does
+                // not recognize is still removed. The armor line is matched on its
+                // own as well: a truncated or quoted block still names a key.
+                Kind::ApiKey,
+                Regex::new(
+                    r"(?x)
+                    -----BEGIN[\x20A-Z]{0,20}PRIVATE\x20KEY-----
+                    [\s\S]{0,8192}?
+                    -----END[\x20A-Z]{0,20}PRIVATE\x20KEY-----
+                  | -----BEGIN[\x20A-Z]{0,20}PRIVATE\x20KEY-----
+                ",
+                )
+                .expect("pem private key pattern is valid"),
+            ),
+            (
+                // Labeled secrets that carry no recognizable prefix: a password,
+                // bearer token, or house-built key is just a string, so shape
+                // alone can never find it. The label is what marks it, and only
+                // the value after the separator is captured. Quotes and trailing
+                // punctuation are excluded so `password: "hunter2",` tokenizes
+                // `hunter2` and leaves the JSON or YAML around it intact.
+                //
+                // A leading `$` and any `<`/`>` are rejected, so environment
+                // references (`api-key: $ANTHROPIC_API_KEY`), placeholders
+                // (`<your-key-here>`), and type annotations
+                // (`private_key: Option<String>`) stay readable.
+                //
+                // ponytail: a bare PascalCase type wider than 8 characters
+                // (`client_secret: SecretString`) still tokenizes. It round-trips
+                // intact, so the cost is model readability, not correctness. Add a
+                // type-shape deny list if code-heavy prompts show the noise.
+                Kind::ApiKey,
+                Regex::new(
+                    r#"(?ix:
+                        \b(?: password | passwd | secret | api[_-]?key | auth[_-]?token
+                             | access[_-]?token | refresh[_-]?token | client[_-]?secret
+                             | private[_-]?key | bearer )
+                        \b ["']? \s* [:=] \s* ["']?
+                    )([^\s"',;$<>][^\s"',;<>]{7,199})"#,
+                )
+                .expect("labeled secret pattern is valid"),
             ),
             (
                 Kind::Email,
@@ -1225,6 +1287,95 @@ mod tests {
             values(&detector, "my name is Quentin Farsworth"),
             ["Quentin Farsworth"]
         );
+    }
+
+    #[test]
+    fn detects_pat_tokens_and_pem_private_keys() {
+        let detector = Detector::default();
+
+        // `pat_` tokens, but not snake_case source identifiers sharing the prefix.
+        assert_eq!(
+            values(&detector, "token pat_A1b2C3d4E5f6G7h8I9j0K1 here"),
+            ["pat_A1b2C3d4E5f6G7h8I9j0K1"]
+        );
+        assert!(values(&detector, "let pat_matcher_state = 1;").is_empty());
+
+        // Stripe live and test secrets.
+        assert_eq!(
+            values(&detector, "sk_live_51H8xQzJK9mNpQrStUvWxYz0123456789"),
+            ["sk_live_51H8xQzJK9mNpQrStUvWxYz0123456789"]
+        );
+
+        // A whole PEM block is one detection, regardless of the file it came
+        // from: content, not extension, is what marks it as key material.
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\nb2FuZHNvb24=\n-----END RSA PRIVATE KEY-----";
+        assert_eq!(values(&detector, &format!("key:\n{pem}\ndone")), [pem]);
+
+        // A bare armor line still names a key when the block is truncated.
+        assert_eq!(
+            values(&detector, "starts -----BEGIN PRIVATE KEY----- then stops"),
+            ["-----BEGIN PRIVATE KEY-----"]
+        );
+
+        // Every armor variant in common use, not just RSA.
+        for label in ["RSA ", "EC ", "OPENSSH ", "DSA ", "ENCRYPTED ", ""] {
+            let armor = format!("-----BEGIN {label}PRIVATE KEY-----");
+            assert_eq!(
+                values(&detector, &format!("k {armor} z")),
+                [armor.as_str()],
+                "{armor}"
+            );
+        }
+
+        // Round-trip: a redacted key comes back byte-identical.
+        let original = format!("deploy with\n{pem}\n");
+        let anonymized = detector.anonymize(&original);
+        assert!(!anonymized.text.contains("MIIEowIBAAKCAQEA"));
+        assert_eq!(restore(&anonymized.text, &anonymized.mappings), original);
+    }
+
+    #[test]
+    fn detects_vendor_key_prefixes() {
+        let detector = Detector::default();
+
+        for key in [
+            "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",
+            "npm_a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8",
+            "hf_aBcDeFgHiJkLmNoPqRsTuVwXyZ012345",
+            "dop_v1_a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8",
+            "dapi0123456789abcdef0123456789abcdef",
+            "ASIAQRSTUVWXYZ234567",
+        ] {
+            assert_eq!(values(&detector, &format!("key {key} end")), [key], "{key}");
+        }
+    }
+
+    #[test]
+    fn detects_labeled_secrets_without_a_known_prefix() {
+        let detector = Detector::default();
+
+        // The value is taken, the label stays readable for the model.
+        assert_eq!(
+            values(&detector, "password: hunter2CorrectHorse!"),
+            ["hunter2CorrectHorse!"]
+        );
+        assert_eq!(
+            values(&detector, r#"{"client_secret": "s3rv1ce-w1de-value"}"#),
+            ["s3rv1ce-w1de-value"]
+        );
+        assert_eq!(
+            values(&detector, "API_KEY=ZmFrZS12YWx1ZS1mb3ItdGVzdA"),
+            ["ZmFrZS12YWx1ZS1mb3ItdGVzdA"]
+        );
+
+        // Prose about secrets is not a secret: no separator, nothing taken.
+        assert!(values(&detector, "rotate the password before Friday").is_empty());
+
+        // Environment references, placeholders, and type annotations name no
+        // value, so they stay readable.
+        assert!(values(&detector, "-H \"x-api-key: $ANTHROPIC_API_KEY\"").is_empty());
+        assert!(values(&detector, "api_key: <your-key-here>").is_empty());
+        assert!(values(&detector, "private_key: Option<String>").is_empty());
     }
 
     #[test]
