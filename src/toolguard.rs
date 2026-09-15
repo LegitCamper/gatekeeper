@@ -8,15 +8,34 @@
 //! `.env.example` is the intended setup flow — reads are not, because a read's
 //! contents ride the next outbound request to the provider untouched.
 //!
-//! `ponytail:` the shell rules are positional heuristics, not a shell parser.
-//! Unknown or exotic spellings fail closed (denied), which is safe but can
-//! reject an unusual write; upgrade path is a real command parser.
+//! `ponytail:` shell rules are conservative token heuristics, not a shell parser.
+//! Known quote, escape, glob, assignment, connector, and redirection forms are
+//! normalized; arbitrary shell expansion cannot be proven safe. Upgrade path is a
+//! real command parser or blocking all shell calls that mention protected stems.
 
 use serde_json::{Value, map::Map};
 
 /// Exact basenames protected from reads. `.env` is matched whole so the
 /// `.env.example` / `.env.local` / `.envrc` shapes stay reachable.
-const PROTECTED_BASENAMES: &[&str] = &[".env"];
+const PROTECTED_BASENAMES: &[&str] = &[
+    ".env",
+    ".git-credentials",
+    ".npmrc",
+    ".pgpass",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+    "id_rsa",
+    "secrets.yaml",
+    "secrets.yml",
+];
+
+/// Exact path suffixes whose basename alone is too generic to block. Slash form
+/// is canonicalized by [`protected_segment`] before comparison.
+const PROTECTED_PATH_SUFFIXES: &[(&str, &str)] = &[
+    ("/.aws/credentials", "AWS credentials"),
+    ("/.kube/config", "Kubernetes config"),
+];
 
 /// Extensions protected from reads: a private key is a private key whatever it
 /// is called. Public keys (`.pub`) are deliberately absent — they are meant to
@@ -79,12 +98,22 @@ fn is_invocation(map: &Map<String, Value>) -> bool {
 
 fn invocation_read(map: &Map<String, Value>) -> Option<&'static str> {
     // Checked first so a write tool is exempt from the guard entirely.
-    let writes = matches!(
-        map.get("name"),
-        Some(Value::String(name)) if WRITE_TOOLS.iter().any(|tool| tool == name)
-    );
-    if writes {
+    let name = map.get("name").and_then(Value::as_str).or_else(|| {
+        map.get("function")
+            .and_then(Value::as_object)
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str)
+    });
+    if name.is_some_and(|name| WRITE_TOOLS.contains(&name)) {
         return None;
+    }
+    let shell = name
+        .is_some_and(|name| matches!(name.to_ascii_lowercase().as_str(), "bash" | "shell" | "sh"));
+    if shell && map.values().any(contains_dynamic_shell) {
+        // A token heuristic cannot know what `${x}`, `$()`, or backticks expand
+        // to. Fail closed for shell invocations rather than claiming exotic
+        // spellings are safe.
+        return Some("dynamic shell expansion");
     }
     for key in [
         "input",
@@ -110,6 +139,15 @@ fn invocation_read(map: &Map<String, Value>) -> Option<&'static str> {
         }
     }
     None
+}
+
+fn contains_dynamic_shell(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => map.values().any(contains_dynamic_shell),
+        Value::Array(values) => values.iter().any(contains_dynamic_shell),
+        Value::String(text) => text.contains("${") || text.contains("$(") || text.contains('`'),
+        _ => false,
+    }
 }
 
 /// Every string leaf under a tool's arguments is treated as a path or command;
@@ -146,10 +184,7 @@ fn tokenize(text: &str) -> Vec<String> {
         .replace('>', " > ")
         .split_whitespace()
         .flat_map(|word| word.split(['(', ')', '{', '}']))
-        .map(|token| {
-            token
-                .trim_matches(|c| matches!(c, '"' | '\'' | '`' | '[' | ']' | '<' | ',' | ':' | '$'))
-        })
+        .map(|token| token.trim_matches(|c| matches!(c, '"' | '\'' | '`' | '<' | ',' | ':' | '$')))
         .filter(|token| !token.is_empty())
         .map(str::to_owned)
         .collect()
@@ -158,24 +193,71 @@ fn tokenize(text: &str) -> Vec<String> {
 /// The protected name a token names, if any. Compares the final path segment
 /// exactly and case-sensitively, so `.env.example`, `.env.local`, `my.env`, and
 /// `.envrc` never match.
+fn collapse_singleton_globs(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut output = String::with_capacity(text.len());
+    let mut index = 0;
+    while index < chars.len() {
+        if index + 2 < chars.len()
+            && chars[index] == '['
+            && chars[index + 2] == ']'
+            && (chars[index + 1].is_ascii_alphanumeric() || chars[index + 1] == '.')
+        {
+            output.push(chars[index + 1]);
+            index += 3;
+        } else {
+            output.push(chars[index]);
+            index += 1;
+        }
+    }
+    output
+}
+
 fn protected_segment(token: &str) -> Option<&'static str> {
-    let candidate = match token.rsplit_once(':') {
+    // Concatenated quotes and backslash escapes are equivalent to their plain
+    // spelling in common shells: `.e''nv` and `.en\v` both name `.env`. Globs and
+    // bracket expressions can name a protected file too; normalize the exact
+    // bypass shapes found in the adversarial review, but do not expand arbitrary
+    // shell syntax here.
+    let normalized =
+        collapse_singleton_globs(&token.replace(['\'', '"'], "")).replace(['*', '?'], "");
+    let candidate = match normalized.rsplit_once(':') {
         // A `:line` suffix, as grep-style output and `file:line` arguments use.
         Some((head, tail)) if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) => head,
-        _ => token,
+        _ => normalized.as_str(),
     };
-    let basename = candidate.rsplit(['/', '\\']).next().unwrap_or(candidate);
-    PROTECTED_BASENAMES
-        .iter()
-        .find(|name| **name == basename)
-        .or_else(|| {
-            // A file literally named `.key` is still a key file, so no stem is
-            // required.
-            PROTECTED_EXTENSIONS
-                .iter()
-                .find(|ext| basename.ends_with(**ext))
-        })
-        .copied()
+    // Utilities such as `dd` carry paths after an option assignment (`if=.env`),
+    // and structured tools sometimes serialize them as `path=/srv/.env`.
+    let candidate = candidate
+        .rsplit_once('=')
+        .map_or(candidate, |(_, path)| path);
+
+    // A backslash is both a Windows separator and a shell escape. Check both
+    // interpretations: `C:\\Users\\me\\.env` needs separators preserved, while
+    // `.en\\v` names `.env` in a POSIX shell.
+    for canonical in [candidate.replace('\\', "/"), candidate.replace('\\', "")] {
+        if let Some((_, label)) = PROTECTED_PATH_SUFFIXES
+            .iter()
+            .find(|(suffix, _)| canonical.ends_with(suffix) || canonical == suffix[1..])
+        {
+            return Some(label);
+        }
+        let basename = canonical.rsplit('/').next().unwrap_or(&canonical);
+        if let Some(name) = PROTECTED_BASENAMES
+            .iter()
+            .find(|name| **name == basename)
+            .or_else(|| {
+                // A file literally named `.key` is still a key file, so no stem
+                // is required.
+                PROTECTED_EXTENSIONS
+                    .iter()
+                    .find(|ext| basename.ends_with(**ext))
+            })
+        {
+            return Some(name);
+        }
+    }
+    None
 }
 
 /// `echo x > .env` and `cp .env.example .env` are writes; any other position of
@@ -269,6 +351,48 @@ mod tests {
             assert!(
                 blocked(invocation("Bash", json!({"command": command}))),
                 "expected block: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn adversarial_shell_spellings_are_blocked() {
+        for command in [
+            "cat .e''nv",
+            "cat .en\\v",
+            "cat .env*",
+            "cat .en?v",
+            "cat [.]env",
+            "cat .[e]nv",
+            "x=n; cat .e${x}v",
+            "dd if=.env",
+        ] {
+            assert!(
+                blocked(invocation("Bash", json!({"command": command}))),
+                "expected block: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn common_credential_files_are_blocked() {
+        for path in [
+            "id_rsa",
+            "/home/me/.ssh/id_ecdsa",
+            "/home/me/.ssh/id_ed25519",
+            r"C:\Users\me\.ssh\id_rsa",
+            r"C:\Users\me\.env",
+            "~/.aws/credentials",
+            "/home/me/.kube/config",
+            ".npmrc",
+            ".git-credentials",
+            ".pgpass",
+            "secrets.yaml",
+            "secrets.yml",
+        ] {
+            assert!(
+                blocked(invocation("Read", json!({"file_path": path}))),
+                "expected block: {path}"
             );
         }
     }

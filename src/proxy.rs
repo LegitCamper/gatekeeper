@@ -318,8 +318,30 @@ fn restore_json(value: &mut Value, restorer: &Restorer) {
             for value in values.values_mut() {
                 restore_json(value, restorer);
             }
+            restore_object_keys(values, restorer);
         }
         Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+/// Restore tokens in object keys. Rebuild only changed entries; common path has
+/// no map mutation. Collisions stay tokenized because JSON cannot losslessly hold
+/// two values under the same restored key.
+fn restore_object_keys(values: &mut serde_json::Map<String, Value>, restorer: &Restorer) {
+    let renames: Vec<(String, String)> = values
+        .keys()
+        .filter_map(|key| {
+            let restored = restorer.restore(key);
+            (restored != *key).then(|| (key.clone(), restored))
+        })
+        .collect();
+    for (key, restored) in renames {
+        if values.contains_key(&restored) {
+            continue;
+        }
+        if let Some(value) = values.remove(&key) {
+            values.insert(restored, value);
+        }
     }
 }
 
@@ -469,6 +491,8 @@ fn restore_json_fields(
             }
         }
         Value::Object(values) => {
+            // Restore values under their original field paths first, then rename
+            // keys. Carry state is keyed by that original path across events.
             for (key, value) in values.iter_mut() {
                 let parent = path.len();
                 path.push('.');
@@ -476,6 +500,7 @@ fn restore_json_fields(
                 restore_json_fields(value, path, pending, restorer);
                 path.truncate(parent);
             }
+            restore_object_keys(values, restorer);
         }
         Value::Null | Value::Bool(_) | Value::Number(_) => {}
     }
@@ -762,6 +787,40 @@ mod tests {
         let mut restored: Value = serde_json::from_slice(&anonymized).expect("valid JSON");
         restore_json(&mut restored, &Restorer::new(&mappings));
         assert_eq!(restored, body);
+    }
+
+    #[test]
+    fn restores_tokens_in_json_object_keys_without_losing_collisions() {
+        let mappings = HashMap::from([(
+            "[EMAIL_0123456789ab]".to_owned(),
+            "alice@example.com".to_owned(),
+        )]);
+        let restorer = Restorer::new(&mappings);
+
+        let mut body = json!({"[EMAIL_0123456789ab]": "value"});
+        restore_json(&mut body, &restorer);
+        assert_eq!(body, json!({"alice@example.com": "value"}));
+
+        // JSON cannot represent two values under one restored key. Keep the
+        // tokenized spelling rather than overwrite either field.
+        let mut collision = json!({
+            "[EMAIL_0123456789ab]": "token value",
+            "alice@example.com": "existing value",
+        });
+        restore_json(&mut collision, &restorer);
+        assert_eq!(collision.as_object().expect("object").len(), 2);
+        assert_eq!(collision["alice@example.com"], "existing value");
+        assert_eq!(collision["[EMAIL_0123456789ab]"], "token value");
+
+        // Streaming JSON events use a separate recursive walker.
+        let mut streamed = json!({"delta": {"[EMAIL_0123456789ab]": "value"}});
+        restore_json_fields(
+            &mut streamed,
+            &mut String::new(),
+            &mut StreamCarry::default(),
+            &restorer,
+        );
+        assert_eq!(streamed, json!({"delta": {"alice@example.com": "value"}}));
     }
 
     #[tokio::test]

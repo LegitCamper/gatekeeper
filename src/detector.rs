@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::hash::{BuildHasher, RandomState};
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 use std::sync::LazyLock;
 
 use aho_corasick::{AhoCorasick, MatchKind};
@@ -103,7 +103,24 @@ const GIVEN_NAMES: &str = include_str!("given_names.txt");
 /// Deliberately excludes `to` and `from`: they precede a capitalized pair far
 /// too often in ordinary prose ("from Redis Cluster", "to New York"), and a
 /// person named after one is normally caught by [`GIVEN_NAMES`] anyway.
-const NAME_TRIGGERS: &[&str] = &["attn", "cc", "contact", "regards", "signed", "sincerely"];
+const NAME_TRIGGERS: &[&str] = &[
+    "attn",
+    "cc",
+    "contact",
+    "patient",
+    "regards",
+    "signed",
+    "sincerely",
+];
+
+/// Multi-word proper nouns that otherwise satisfy the dictionary-given-name plus
+/// capitalized-surname rule but are predictably not people in ordinary text.
+const NAME_PHRASE_DENY: &[&str] = &[
+    "Robin Hood",
+    "Sandy Beach",
+    "Sandy Beach Elementary",
+    "customer support",
+];
 
 /// Capitalized words that are never part of a person's name here, even when the
 /// dictionary lists them as a given name (`April`, `May`, `Monday`).
@@ -180,14 +197,31 @@ impl Default for Detector {
                   | github_pat_[A-Za-z0-9_]{20,}
                   | xox[baprs]-[A-Za-z0-9-]{10,}
                   | AIza[0-9A-Za-z_-]{35}
+                  | glpat-[A-Za-z0-9_-]{16,}
+                  | eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}
                 ",
                 )
                 .expect("api key pattern is valid"),
             ),
             (
                 Kind::Email,
-                Regex::new(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}")
-                    .expect("email pattern is valid"),
+                // Small models still understand fullwidth `＠` and zero-width
+                // characters around the separator. Treat those as part of the
+                // address span instead of handing the obfuscated address upstream.
+                Regex::new(
+                    r"(?:[A-Za-z0-9._%+-][\x{200B}\x{200C}\x{200D}\x{FEFF}]*)+[@＠][\x{200B}\x{200C}\x{200D}\x{FEFF}]*(?:[A-Za-z0-9-][\x{200B}\x{200C}\x{200D}\x{FEFF}]*)+(?:\.[\x{200B}\x{200C}\x{200D}\x{FEFF}]*(?:[A-Za-z0-9-][\x{200B}\x{200C}\x{200D}\x{FEFF}]*)+)*\.[\x{200B}\x{200C}\x{200D}\x{FEFF}]*(?:[A-Za-z][\x{200B}\x{200C}\x{200D}\x{FEFF}]*){2,}",
+                )
+                .expect("email pattern is valid"),
+            ),
+            (
+                // A 40-character base64-ish value is common enough that shape
+                // alone is unsafe. Require the AWS secret-key label and capture
+                // only the credential itself.
+                Kind::ApiKey,
+                Regex::new(
+                    r"(?i:\baws(?:_access)?_secret(?:_access)?_key\b[\s:=]{1,4})([A-Za-z0-9/+=]{40})(?:$|[^A-Za-z0-9/+=])",
+                )
+                .expect("aws secret key pattern is valid"),
             ),
             (
                 Kind::CreditCard,
@@ -199,11 +233,40 @@ impl Default for Detector {
             ),
             (
                 Kind::Ssn,
-                Regex::new(r"\b\d{3}-\d{2}-\d{4}\b").expect("ssn pattern is valid"),
+                Regex::new(r"\b\d{3}[-.]\d{2}[-.]\d{4}\b").expect("ssn pattern is valid"),
+            ),
+            (
+                // Unformatted and space-separated SSNs. Nine bare digits are far
+                // too common (order numbers, zip+4, ids) to redact on shape
+                // alone, so these forms require a nearby `ssn`/`social security`.
+                // The value itself is captured, leaving the label in place.
+                Kind::Ssn,
+                Regex::new(
+                    r"(?i:\b(?:ssn|social security(?: number)?)\b[:# ]{0,3})(\d{3} \d{2} \d{4}|\d{9})\b",
+                )
+                .expect("contextual ssn pattern is valid"),
             ),
             (
                 Kind::Ip,
                 Regex::new(r"\b\d{1,3}(?:\.\d{1,3}){3}\b").expect("ip pattern is valid"),
+            ),
+            (
+                // Defanged IPs remain intelligible to a model but dodge the
+                // ordinary dotted-quad pattern. Preserve the exact input in the
+                // mapping; validation normalizes only the separator.
+                Kind::Ip,
+                Regex::new(r"\b\d{1,3}(?:(?:\[\.\]|\(\.\)|\.)\d{1,3}){3}\b")
+                    .expect("defanged ip pattern is valid"),
+            ),
+            (
+                // IPv6: full, leading/trailing/interior compressed, and
+                // IPv4-mapped forms. [`IpAddr::parse`] rejects timestamps, ratios,
+                // bare `::`, and malformed group counts after this shape filter.
+                Kind::Ip,
+                Regex::new(
+                    r"(?i)(?:\b(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}\b|::ffff:\d{1,3}(?:\.\d{1,3}){3}\b|\b(?:[0-9a-f]{1,4}:){1,7}:|\b(?:[0-9a-f]{1,4}:){1,6}:(?:[0-9a-f]{1,4}:){0,5}[0-9a-f]{1,4}\b|::(?:[0-9a-f]{1,4}:){0,6}[0-9a-f]{1,4}\b)",
+                )
+                .expect("ipv6 pattern is valid"),
             ),
             (
                 Kind::Dob,
@@ -223,16 +286,51 @@ impl Default for Detector {
                 .expect("address pattern is valid"),
             ),
             (
+                // Strong identity/title context permits three title-cased words
+                // for names such as `María José García`.
                 Kind::Name,
-                Regex::new(r"(?:[Mm]y name is|[Nn]ame:|Mr\.|Mrs\.|Ms\.|Dr\.) ?([A-Z][a-z]+(?: [A-Z][a-z]+)?)")
-                    .expect("name context pattern is valid"),
+                Regex::new(
+                    r"(?i:\b(?:my name is\b|name:|(?:mr|mrs|ms|dr)\.?) +)((?:\p{Lu}[\p{L}'’-]* +){2}\p{Lu}[\p{L}'’-]*)",
+                )
+                .expect("three-word name identity pattern is valid"),
             ),
             (
-                // A trigger word introducing a capitalized pair, catching names
-                // that are absent from the given-name dictionary.
+                // Lowercase and all-caps names still work in explicit context,
+                // but stop after the given/surname pair so `and`, `called`, etc.
+                // are not swallowed as a third name word.
+                Kind::Name,
+                Regex::new(
+                    r"(?i:\b(?:my name is\b|name:|(?:mr|mrs|ms|dr)\.?) +)([\p{L}][\p{L}'’-]* +[\p{L}][\p{L}'’-]*)",
+                )
+                .expect("name identity pattern is valid"),
+            ),
+            (
+                // Explicit identity/title context is enough for one name word.
+                // This catches `My name is Alice.` without restoring the old bare
+                // dictionary-name false positives.
+                Kind::Name,
+                Regex::new(
+                    r"(?i:\b(?:my name is\b|name:|(?:mr|mrs|ms|dr)\.?) +)([\p{L}][\p{L}'’-]*)",
+                )
+                .expect("single-word name identity pattern is valid"),
+            ),
+            (
+                // General triggers may carry a three-word title-cased name. Keep
+                // this case-sensitive so a trailing lowercase verb is not eaten.
                 Kind::Name,
                 Regex::new(&format!(
-                    r"(?i:\b(?:{})\b)[:,]? +(?-i:([A-Z][a-z]+ [A-Z][a-z]+))",
+                    r"(?i:\b(?:{})\b)[:,]? +((?:\p{{Lu}}[\p{{L}}'’-]* +){{2}}\p{{Lu}}[\p{{L}}'’-]*)",
+                    NAME_TRIGGERS.join("|")
+                ))
+                .expect("three-word name trigger pattern is valid"),
+            ),
+            (
+                // General person triggers capture exactly a given/surname pair,
+                // avoiding a trailing lowercase verb (`patient alice johnson
+                // called`) while still covering lowercase and all-caps names.
+                Kind::Name,
+                Regex::new(&format!(
+                    r"(?i:\b(?:{})\b)[:,]? +([\p{{L}}][\p{{L}}'’-]* +[\p{{L}}][\p{{L}}'’-]*)",
                     NAME_TRIGGERS.join("|")
                 ))
                 .expect("name trigger pattern is valid"),
@@ -338,10 +436,14 @@ impl Detector {
                 continue; // Given name is followed by more word characters (e.g., "Rus" in "Rust")
             }
 
-            // Try to extend name with following capitalized words (surnames, middle names)
-            let end = match end_of_name(text, given_end) {
-                Some(e) => e,      // Has following capitalized word(s)
-                None => given_end, // No following word, just use given name
+            // A dictionary given name is not enough by itself: Ruby, Jordan,
+            // Frank, Max, Sandy, and Dell are all ordinary words or brands. A
+            // following surname is the second signal that makes a bare-text hit
+            // worth redacting. Explicit person-context patterns above still catch
+            // a full name regardless of dictionary membership or casing.
+            let compound_given_end = end_of_hyphenated_word(text, given_end).unwrap_or(given_end);
+            let Some(end) = end_of_name(text, compound_given_end) else {
+                continue;
             };
 
             // Validate the detected name
@@ -792,8 +894,13 @@ fn validate(kind: Kind, text: &str, start: usize, end: usize) -> Option<(usize, 
         Kind::CreditCard => accept_or_tighten(text, start, end, is_payment_card),
         // Loopback and `0.0.0.0` identify nobody; tokenizing them breaks config
         // and bind-address round-trips.
+        // Same loopback/unspecified exemption for both families: `::1` and
+        // `0.0.0.0` identify nobody, and tokenizing them breaks bind-address and
+        // config round-trips.
         Kind::Ip => value
-            .parse::<Ipv4Addr>()
+            .replace("[.]", ".")
+            .replace("(.)", ".")
+            .parse::<IpAddr>()
             .ok()
             .filter(|address| !(address.is_loopback() || address.is_unspecified()))
             .map(|_| (start, end)),
@@ -807,10 +914,9 @@ fn validate(kind: Kind, text: &str, start: usize, end: usize) -> Option<(usize, 
             accept_or_tighten(text, start, end, is_phone)
         }
         // Reject when any word of the pair is a calendar or direction word.
-        Kind::Name => value
-            .split(' ')
-            .all(|word| !NAME_DENY.contains(&word))
-            .then_some((start, end)),
+        Kind::Name => (!NAME_PHRASE_DENY.contains(&value)
+            && value.split(' ').all(|word| !NAME_DENY.contains(&word)))
+        .then_some((start, end)),
         _ => Some((start, end)),
     }
 }
@@ -891,82 +997,50 @@ fn is_phone(value: &str) -> bool {
     (dialable && structured) || PHONE_SHAPES.iter().any(|shape| shape.is_match(value))
 }
 
-/// End position of capitalized word(s) following position, or None if not capitalized.
-/// Captures multi-word names like "Joe Smith" or "Joe Marie Smith".
-fn end_of_name(text: &str, start: usize) -> Option<usize> {
-    let rest = text.get(start..)?;
-    let rest = rest.strip_prefix(' ')?;
-    let first_word_start = start + 1;
-
-    let mut chars = rest.char_indices();
-    let (_, first) = chars.next()?;
-    if !first.is_ascii_uppercase() {
-        return None;
-    }
-
-    // Find the end of the first capitalized word
-    let end = rest
-        .char_indices()
-        .find(|(_, c)| !c.is_ascii_alphabetic())
-        .map_or(rest.len(), |(offset, _)| offset);
-
-    // Require at least 2 characters for a valid word
-    if end < 2 {
-        return None;
-    }
-
-    let mut current_end = first_word_start + end;
-
-    // Try to extend with additional capitalized words (middle names, surnames, etc.)
-    loop {
-        let next_rest = text.get(current_end..)?;
-        let next_rest = match next_rest.strip_prefix(' ') {
-            Some(r) => r,
-            None => break, // No space after current word, stop
-        };
-
-        // Check if next word starts with capital
-        let mut chars = next_rest.char_indices();
-        let (_, first_char) = chars.next()?;
-        if !first_char.is_ascii_uppercase() {
-            break; // Next word not capitalized, stop
-        }
-
-        // Find end of this word
-        let next_len = next_rest
-            .char_indices()
-            .find(|(_, c)| !c.is_ascii_alphabetic())
-            .map_or(next_rest.len(), |(offset, _)| offset);
-
-        // Require at least 2 characters
-        if next_len < 2 {
-            break;
-        }
-
-        current_end += 1 + next_len; // space + word
-    }
-
-    Some(current_end)
+fn person_word_len(text: &str) -> usize {
+    text.char_indices()
+        .find(|(_, c)| !(c.is_alphabetic() || matches!(c, '\'' | '’' | '-')))
+        .map_or(text.len(), |(offset, _)| offset)
 }
 
-/// End offset of a `Given Surname` pair, or `None` when no surname follows.
-#[allow(dead_code)]
-fn surname_end(text: &str, given_end: usize) -> Option<usize> {
-    let rest = text.get(given_end..)?;
-    let rest = rest.strip_prefix(' ')?;
-    let surname_start = given_end + 1;
-
-    let mut chars = rest.char_indices();
-    let (_, first) = chars.next()?;
-    if !first.is_ascii_uppercase() {
+/// Extend a dictionary given name through a capitalized hyphen suffix, turning
+/// the `Jean` dictionary hit in `Jean-Luc Picard` into the complete given name.
+fn end_of_hyphenated_word(text: &str, start: usize) -> Option<usize> {
+    let rest = text.get(start..)?.strip_prefix('-')?;
+    if !rest.chars().next()?.is_uppercase() {
         return None;
     }
+    let length = person_word_len(rest);
+    (length >= 2).then_some(start + 1 + length)
+}
 
-    let length = rest
-        .char_indices()
-        .find(|(_, c)| !c.is_ascii_alphabetic())
-        .map_or(rest.len(), |(offset, _)| offset);
-    (length >= 2).then_some(surname_start + length)
+/// End position of one or more capitalized surname words following a given name.
+/// Unicode case/letters matter here: `Søren Kierkegaard` is no less a name than
+/// `Alice Johnson`.
+fn end_of_name(text: &str, start: usize) -> Option<usize> {
+    let mut current_end = start;
+    let mut words = 0;
+    while words < 3 {
+        let Some(rest) = text
+            .get(current_end..)
+            .and_then(|rest| rest.strip_prefix(' '))
+        else {
+            break;
+        };
+        let Some(first) = rest.chars().next() else {
+            break;
+        };
+        if !first.is_uppercase() {
+            break;
+        }
+        let length = person_word_len(rest);
+        if rest[..length].chars().filter(|c| c.is_alphabetic()).count() < 2 {
+            break;
+        }
+        current_end += 1 + length;
+        words += 1;
+    }
+    (words > 0).then_some(current_end)
 }
 
 fn is_word_byte(byte: u8) -> bool {
@@ -999,6 +1073,8 @@ fn resolve(mut candidates: Vec<Detection>) -> Vec<Detection> {
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
+
     use super::*;
 
     fn kinds(detector: &Detector, text: &str) -> Vec<Kind> {
