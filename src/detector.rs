@@ -73,9 +73,22 @@ pub struct Anonymized {
     pub mappings: HashMap<String, String>,
 }
 
-/// Token literal shape produced by [`Detector::anonymize`], e.g. `[EMAIL_1f4c9a0b7e26]`.
-static TOKEN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\[[A-Z][A-Z_]*_[0-9a-f]{12}\]").expect("token pattern is valid"));
+const DIGEST_LEN: usize = 12;
+const MAX_TOKEN_CARRY: usize = 64;
+const TOKEN_DECORATION_LABELS: &[&str] = &[
+    "API_KEY",
+    "EMAIL",
+    "CARD",
+    "CREDIT_CARD",
+    "SSN",
+    "IP",
+    "DOB",
+    "PHONE",
+    "ADDRESS",
+    "NAME",
+    "CONTACT",
+    "REDACTED",
+];
 
 /// Multi-origin given names, one per line. Entries that are also ordinary
 /// English dictionary words were removed unless they are common enough as names
@@ -344,20 +357,223 @@ impl Detector {
     }
 }
 
-/// Replace known tokens with their original values, leaving unknown tokens as-is.
-pub fn restore(text: &str, mappings: &HashMap<String, String>) -> String {
-    if mappings.is_empty() || !text.contains('[') {
-        return text.to_owned();
+/// Restores values using canonical tokens or their request-local 12-hex digest.
+pub(crate) struct Restorer {
+    tokens: HashMap<String, String>,
+    digests: HashMap<String, Option<String>>,
+    digests_with_case: Vec<String>,
+}
+
+#[derive(Default)]
+pub(crate) struct RestoreCarry {
+    pub(crate) text: String,
+    pub(crate) skip_closing_bracket: bool,
+}
+
+impl Restorer {
+    pub(crate) fn new(mappings: &HashMap<String, String>) -> Self {
+        let mut digests: HashMap<String, Option<String>> = HashMap::new();
+        for (token, original) in mappings {
+            let Some(digest) = token
+                .strip_suffix(']')
+                .and_then(|token| token.rsplit_once('_'))
+                .map(|(_, digest)| digest)
+                .filter(|digest| {
+                    digest.len() == DIGEST_LEN
+                        && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+            else {
+                continue;
+            };
+            let digest = digest.to_ascii_lowercase();
+            digests
+                .entry(digest)
+                .and_modify(|stored| {
+                    if stored.as_deref() != Some(original) {
+                        *stored = None;
+                    }
+                })
+                .or_insert_with(|| Some(original.clone()));
+        }
+
+        let digests_with_case = digests
+            .iter()
+            .filter(|(_, original)| original.is_some())
+            .flat_map(|(digest, _)| [digest.clone(), digest.to_ascii_uppercase()])
+            .collect();
+
+        Self {
+            tokens: mappings.clone(),
+            digests,
+            digests_with_case,
+        }
     }
 
-    TOKEN
-        .replace_all(text, |captures: &regex::Captures| {
-            let token = &captures[0];
-            mappings
-                .get(token)
-                .map_or_else(|| token.to_owned(), Clone::clone)
+    pub(crate) fn restore(&self, text: &str) -> String {
+        let mut carry = RestoreCarry::default();
+        let mut restored = self.restore_fragment(text, &mut carry);
+        restored.push_str(&carry.text);
+        restored
+    }
+
+    pub(crate) fn restore_fragment(&self, text: &str, carry: &mut RestoreCarry) -> String {
+        if self.tokens.is_empty() {
+            return text.to_owned();
+        }
+
+        let text = if carry.skip_closing_bracket {
+            carry.skip_closing_bracket = false;
+            text.strip_prefix(']').unwrap_or(text)
+        } else {
+            text
+        };
+        let full_text = if carry.text.is_empty() {
+            text.to_owned()
+        } else {
+            let mut combined = std::mem::take(&mut carry.text);
+            combined.push_str(text);
+            combined
+        };
+        let bytes = full_text.as_bytes();
+        let mut output = String::with_capacity(full_text.len());
+        let mut cursor = 0;
+
+        while cursor < full_text.len() {
+            if let Some((token, original)) = self
+                .tokens
+                .iter()
+                .find(|(token, _)| full_text[cursor..].starts_with(token.as_str()))
+            {
+                output.push_str(original);
+                cursor += token.len();
+                continue;
+            }
+
+            if cursor + DIGEST_LEN <= full_text.len()
+                && bytes[cursor..cursor + DIGEST_LEN]
+                    .iter()
+                    .all(u8::is_ascii_hexdigit)
+            {
+                let digest = full_text[cursor..cursor + DIGEST_LEN].to_ascii_lowercase();
+                if let Some(Some(original)) = self.digests.get(&digest) {
+                    let decorated = decoration_start(&full_text, cursor);
+                    let bracketed = cursor > 0
+                        && bytes[cursor - 1] == b'['
+                        && bytes.get(cursor + DIGEST_LEN) == Some(&b']');
+                    let start = decorated.or_else(|| bracketed.then(|| cursor - 1));
+                    if let Some(start) = start {
+                        let decoration = &full_text[start..cursor];
+                        if output.ends_with(decoration) {
+                            output.truncate(output.len() - decoration.len());
+                        }
+                    }
+                    output.push_str(original);
+                    cursor += DIGEST_LEN;
+                    if start.is_some() {
+                        if bytes.get(cursor) == Some(&b']') {
+                            cursor += 1;
+                        } else if cursor == full_text.len() {
+                            carry.skip_closing_bracket = true;
+                        }
+                    }
+                    continue;
+                }
+            }
+
+            let next = full_text[cursor..]
+                .chars()
+                .next()
+                .expect("cursor is before string end")
+                .len_utf8();
+            output.push_str(&full_text[cursor..cursor + next]);
+            cursor += next;
+        }
+
+        let keep = partial_suffix_len(&output, &self.tokens, &self.digests_with_case);
+        if keep > 0 {
+            carry.text.push_str(&output[output.len() - keep..]);
+            output.truncate(output.len() - keep);
+        }
+        output
+    }
+}
+
+fn decoration_start(text: &str, digest_start: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let separator = digest_start.checked_sub(1)?;
+    if !matches!(bytes[separator], b'_' | b':' | b'-') {
+        return None;
+    }
+
+    let mut label_start = separator;
+    while label_start > 0 {
+        let byte = bytes[label_start - 1];
+        if byte.is_ascii_uppercase() || byte == b'_' {
+            label_start -= 1;
+        } else {
+            break;
+        }
+    }
+    if label_start == separator {
+        return None;
+    }
+    if label_start > 0 && bytes[label_start - 1].is_ascii_alphanumeric() {
+        return None;
+    }
+    Some(if label_start > 0 && bytes[label_start - 1] == b'[' {
+        label_start - 1
+    } else {
+        label_start
+    })
+}
+
+fn partial_suffix_len(text: &str, tokens: &HashMap<String, String>, digests: &[String]) -> usize {
+    let mut starts: Vec<usize> = text
+        .char_indices()
+        .map(|(index, _)| index)
+        .filter(|index| text.len() - index <= MAX_TOKEN_CARRY)
+        .collect();
+    starts.push(text.len());
+    starts
+        .into_iter()
+        .find(|start| {
+            let suffix = &text[*start..];
+            if suffix.is_empty() {
+                return false;
+            }
+            if tokens.keys().any(|token| token.starts_with(suffix)) {
+                return true;
+            }
+            digests.iter().any(|digest| digest.starts_with(suffix))
+                || ((*start == 0 || !text.as_bytes()[start - 1].is_ascii_alphanumeric())
+                    && token_decoration_prefix(suffix, digests))
         })
-        .into_owned()
+        .map_or(0, |start| text.len() - start)
+}
+
+fn token_decoration_prefix(text: &str, digests: &[String]) -> bool {
+    let text = text.strip_prefix('[').unwrap_or(text);
+    if text.is_empty() {
+        return true;
+    }
+
+    TOKEN_DECORATION_LABELS.iter().any(|label| {
+        if label.starts_with(text) {
+            return true;
+        }
+        let Some(suffix) = text
+            .strip_prefix(label)
+            .and_then(|text| text.strip_prefix(['_', ':', '-']))
+        else {
+            return false;
+        };
+        suffix.is_empty() || digests.iter().any(|digest| digest.starts_with(suffix))
+    })
+}
+
+/// Replace known tokens and model-mutated forms with original values.
+pub fn restore(text: &str, mappings: &HashMap<String, String>) -> String {
+    Restorer::new(mappings).restore(text)
 }
 
 /// Reject candidates that only look like the category, and tighten spans.
@@ -748,22 +964,80 @@ mod tests {
     }
 
     #[test]
-    fn restore_leaves_unknown_tokens_alone() {
-        let mut mappings = HashMap::new();
-        mappings.insert(
+    fn restore_recognizes_hash_despite_model_formatting() {
+        let mappings = HashMap::from([(
             "[EMAIL_0123456789ab]".to_owned(),
             "a@example.com".to_owned(),
-        );
+        )]);
+
+        for text in [
+            "[EMAIL_0123456789ab]",
+            "EMAIL_0123456789ab",
+            "CONTACT:0123456789ab",
+            "REDACTED-0123456789ab",
+            "[0123456789ab]",
+            "0123456789ab",
+            "0123456789AB",
+        ] {
+            assert_eq!(
+                restore(text, &mappings),
+                "a@example.com",
+                "failed for {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn restore_replaces_known_hash_inside_model_text() {
+        let mappings = HashMap::from([(
+            "[CARD_0123456789ab]".to_owned(),
+            "4111 1111 1111 1111".to_owned(),
+        )]);
 
         assert_eq!(
-            restore("to [EMAIL_0123456789ab] and [NAME_ffffffffffff]", &mappings),
-            "to a@example.com and [NAME_ffffffffffff]"
+            restore("Card: ref=0123456789ab.", &mappings),
+            "Card: ref=4111 1111 1111 1111."
         );
+    }
+
+    #[test]
+    fn restore_leaves_unknown_and_nearby_hashes_alone() {
+        let mappings = HashMap::from([(
+            "[EMAIL_0123456789ab]".to_owned(),
+            "a@example.com".to_owned(),
+        )]);
+        let text = "[NAME_ffffffffffff] 0123456789aa 0123456789a abcdef0123456789ac";
+
+        assert_eq!(restore(text, &mappings), text);
         assert_eq!(restore("plain text", &mappings), "plain text");
         assert_eq!(
             restore("[EMAIL_0123456789ab]", &HashMap::new()),
             "[EMAIL_0123456789ab]"
         );
+    }
+
+    #[test]
+    fn restore_does_not_rescan_original_values() {
+        let mappings = HashMap::from([
+            (
+                "[EMAIL_0123456789ab]".to_owned(),
+                "original-fedcba987654".to_owned(),
+            ),
+            ("[NAME_fedcba987654]".to_owned(), "wrong".to_owned()),
+        ]);
+
+        assert_eq!(restore("0123456789ab", &mappings), "original-fedcba987654");
+    }
+
+    #[test]
+    fn restore_fails_closed_for_colliding_hashes() {
+        let mappings = HashMap::from([
+            ("[EMAIL_0123456789ab]".to_owned(), "first".to_owned()),
+            ("[NAME_0123456789ab]".to_owned(), "second".to_owned()),
+        ]);
+
+        assert_eq!(restore("0123456789ab", &mappings), "0123456789ab");
+        assert_eq!(restore("[EMAIL_0123456789ab]", &mappings), "first");
     }
 
     #[test]

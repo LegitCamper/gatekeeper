@@ -22,7 +22,6 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 use gatekeeper::detector::Detector;
 use gatekeeper::proxy::{ProxyState, router};
-use gatekeeper::vault::{MemoryVault, VaultConfig};
 use regex::Regex;
 use tokio::net::TcpListener;
 
@@ -39,6 +38,10 @@ fn prompt() -> String {
 
 fn token_pattern() -> Regex {
     Regex::new(r"\[[A-Z][A-Z_]*_[0-9a-f]{12}\]").expect("token pattern is valid")
+}
+
+fn digest_pattern() -> Regex {
+    Regex::new(r"\b[0-9A-F]{12}\b").expect("digest pattern is valid")
 }
 
 /// Echoes the request body back, gzipping it when the caller said it could
@@ -82,16 +85,22 @@ async fn stream(request: Request) -> Response {
     let token = token_pattern()
         .find(&text)
         .expect("upstream was handed an anonymized body")
-        .as_str()
-        .to_owned();
+        .as_str();
+    let digest = token
+        .strip_suffix(']')
+        .and_then(|token| token.rsplit_once('_'))
+        .map(|(_, digest)| digest)
+        .expect("canonical token has a digest")
+        .to_ascii_uppercase();
+    let mutated = format!("CONTACT:{digest}");
 
     // Token is ASCII, so byte slicing is safe.
-    let (quarter, half) = (token.len() / 4, token.len() / 2);
-    let head = format!("data: {{\"text\":\"{}", &token[..quarter]);
+    let (quarter, half) = (mutated.len() / 4, mutated.len() / 2);
+    let head = format!("data: {{\"text\":\"{}", &mutated[..quarter]);
     let tail = format!(
         "{}\ndata: {}\"}}\n\ndata: [DONE]\n\n",
-        &token[quarter..half],
-        &token[half..]
+        &mutated[quarter..half],
+        &mutated[half..]
     );
 
     let body = async_stream::stream! {
@@ -160,12 +169,41 @@ async fn serve(app: Router) -> String {
     format!("http://{address}")
 }
 
+/// Remembers the first placeholder it is ever sent and replays it in every
+/// later response, standing in for a model that emits a token it was not given
+/// in this request.
+async fn replay(request: Request) -> Response {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<Option<String>>> = std::sync::OnceLock::new();
+    let seen = SEEN.get_or_init(|| std::sync::Mutex::new(None));
+
+    let bytes = to_bytes(request.into_body(), usize::MAX)
+        .await
+        .expect("upstream read the request body");
+    let text = String::from_utf8_lossy(&bytes);
+    if let Some(found) = token_pattern().find(&text) {
+        let mut slot = seen.lock().expect("replay mutex");
+        slot.get_or_insert_with(|| found.as_str().to_owned());
+    }
+    let replayed = seen
+        .lock()
+        .expect("replay mutex")
+        .clone()
+        .unwrap_or_default();
+
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({ "content": replayed }).to_string(),
+    )
+        .into_response()
+}
+
 async fn spawn_upstream() -> String {
     serve(
         Router::new()
             .route("/v1/messages", post(echo))
             .route("/v1/stream", post(stream))
-            .route("/v1/gzip-stream", post(gzipped_stream)),
+            .route("/v1/gzip-stream", post(gzipped_stream))
+            .route("/v1/replay", post(replay)),
     )
     .await
 }
@@ -175,10 +213,6 @@ async fn spawn_gatekeeper(target: &str) -> String {
         target.parse().expect("valid target URL"),
         reqwest::Client::new(),
         Arc::new(Detector::default()),
-        Arc::new(MemoryVault::new(VaultConfig {
-            ttl: Duration::from_secs(60),
-            max_entries: 100,
-        })),
         1024 * 1024,
         None,
     );
@@ -282,8 +316,47 @@ async fn gzipped_sse_does_not_leak_tokens_to_the_client() {
     );
 }
 
+/// A placeholder minted for one request must stay opaque in a later request's
+/// response: restoration is scoped to the request that created the mapping.
 #[tokio::test]
-async fn sse_tokens_restore_across_real_tcp_chunks() {
+async fn placeholder_from_an_earlier_request_is_not_restored() {
+    let upstream = spawn_upstream().await;
+    let gatekeeper = spawn_gatekeeper(&upstream).await;
+
+    // First request mints a mapping for the email and teaches the upstream its
+    // placeholder.
+    client()
+        .post(format!("{gatekeeper}/v1/replay"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .json(&serde_json::json!({"messages": [{"content": prompt()}]}))
+        .send()
+        .await
+        .expect("gatekeeper responded");
+
+    // Second request carries no PII, so it owns no mappings.
+    let body = client()
+        .post(format!("{gatekeeper}/v1/replay"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .json(&serde_json::json!({"messages": [{"content": "summarize the changelog"}]}))
+        .send()
+        .await
+        .expect("gatekeeper responded")
+        .text()
+        .await
+        .expect("utf-8 response body");
+
+    assert!(
+        !body.contains(&email()),
+        "another request's value leaked into this response: {body}"
+    );
+    assert!(
+        token_pattern().is_match(&body),
+        "replayed placeholder should reach the client verbatim: {body}"
+    );
+}
+
+#[tokio::test]
+async fn mangled_hashes_restore_across_real_tcp_chunks() {
     let upstream = spawn_upstream().await;
     let gatekeeper = spawn_gatekeeper(&upstream).await;
     let email = email();
@@ -301,6 +374,14 @@ async fn sse_tokens_restore_across_real_tcp_chunks() {
     assert!(
         !token_pattern().is_match(&body),
         "a token survived into the client: {body}"
+    );
+    assert!(
+        !digest_pattern().is_match(&body),
+        "a bare digest survived into the client: {body}"
+    );
+    assert!(
+        !body.contains("CONTACT:"),
+        "token decoration survived: {body}"
     );
     assert!(
         body.ends_with("data: [DONE]\n\n"),

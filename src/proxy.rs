@@ -17,15 +17,13 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use url::{Position, Url};
 
-use crate::detector::{Detector, restore};
-use crate::vault::MemoryVault;
+use crate::detector::{Detector, RestoreCarry, Restorer};
 
 #[derive(Clone)]
 pub struct ProxyState {
     target_url: Url,
     client: reqwest::Client,
     detector: Arc<Detector>,
-    vault: Arc<MemoryVault>,
     max_body_bytes: usize,
     upstream_auth: Option<(HeaderName, HeaderValue)>,
 }
@@ -35,7 +33,6 @@ impl ProxyState {
         target_url: Url,
         client: reqwest::Client,
         detector: Arc<Detector>,
-        vault: Arc<MemoryVault>,
         max_body_bytes: usize,
         upstream_auth: Option<(HeaderName, HeaderValue)>,
     ) -> Self {
@@ -43,7 +40,6 @@ impl ProxyState {
             target_url,
             client,
             detector,
-            vault,
             max_body_bytes,
             upstream_auth,
         }
@@ -109,18 +105,14 @@ async fn proxy(State(state): State<ProxyState>, request: Request<Body>) -> Respo
         Err(_) => return json_error(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"),
     };
 
-    let outgoing_body = if content_type.as_deref().is_some_and(is_json) {
+    // Mappings belong to this request alone: a placeholder only resolves in the
+    // response to the request that created it, so one client's values can never
+    // be spliced into another's response, and model-invented text is untouched.
+    let (outgoing_body, mappings) = if content_type.as_deref().is_some_and(is_json) {
         match anonymize_json_body(&body, &state.detector) {
             Ok((body, mappings)) => {
-                tracing::debug!("anonymize_json_body: found {} mappings", mappings.len());
-                if !mappings.is_empty() {
-                    for (token, value) in &mappings {
-                        tracing::debug!("  mapping: {} -> {}", token, value);
-                    }
-                    state.vault.store(mappings);
-                    tracing::debug!("stored mappings in vault");
-                }
-                body
+                tracing::debug!(count = mappings.len(), "anonymized request");
+                (body, mappings)
             }
             Err(error) => {
                 return json_error(
@@ -131,7 +123,7 @@ async fn proxy(State(state): State<ProxyState>, request: Request<Body>) -> Respo
         }
     } else {
         tracing::debug!("request not JSON, skipping anonymization");
-        body
+        (body, HashMap::new())
     };
 
     let mut upstream = state.client.request(method, target);
@@ -164,15 +156,18 @@ async fn proxy(State(state): State<ProxyState>, request: Request<Body>) -> Respo
         }
     };
 
-    upstream_response(upstream, &state).await
+    upstream_response(upstream, &state, mappings).await
 }
 
-async fn upstream_response(upstream: reqwest::Response, state: &ProxyState) -> Response<Body> {
+async fn upstream_response(
+    upstream: reqwest::Response,
+    state: &ProxyState,
+    mappings: HashMap<String, String>,
+) -> Response<Body> {
     let status = upstream.status();
     let headers = upstream.headers().clone();
     let response_connection_headers = connection_headers(&headers);
     let response_type = content_type(&headers).map(str::to_owned);
-    let mappings = state.vault.lookup();
 
     tracing::debug!(
         "upstream_response: content-type={:?}, mappings={}",
@@ -180,6 +175,7 @@ async fn upstream_response(upstream: reqwest::Response, state: &ProxyState) -> R
         mappings.len()
     );
 
+    let restorer = Restorer::new(&mappings);
     let body = if mappings.is_empty() {
         // No tokens to restore, pass through as-is
         Body::from_stream(upstream.bytes_stream())
@@ -206,7 +202,7 @@ async fn upstream_response(upstream: reqwest::Response, state: &ProxyState) -> R
                 );
             }
         };
-        restore_json(&mut value, &mappings);
+        restore_json(&mut value, &restorer);
         tracing::debug!("restored JSON response");
         match serde_json::to_vec(&value) {
             Ok(value) => Body::from(value),
@@ -217,15 +213,18 @@ async fn upstream_response(upstream: reqwest::Response, state: &ProxyState) -> R
                 );
             }
         }
-    } else if response_type.as_deref().is_some_and(is_event_stream) {
-        Body::from_stream(restored_sse(upstream.bytes_stream(), mappings))
+    } else if response_type
+        .as_deref()
+        .is_some_and(|kind| is_event_stream(kind) || is_ndjson(kind))
+    {
+        Body::from_stream(restored_lines(upstream.bytes_stream(), restorer))
     } else {
-        // For any other content-type, restore tokens in the text stream
+        // For any other content-type, restore tokens in the text stream.
         tracing::debug!(
             "restoring tokens in non-JSON response (content-type={:?})",
             response_type
         );
-        Body::from_stream(restored_text_stream(upstream.bytes_stream(), mappings))
+        Body::from_stream(restored_text_stream(upstream.bytes_stream(), restorer))
     };
 
     let mut response = Response::builder().status(status);
@@ -276,31 +275,44 @@ fn anonymize_json(value: &mut Value, detector: &Detector, mappings: &mut HashMap
     }
 }
 
-fn restore_json(value: &mut Value, mappings: &HashMap<String, String>) {
+fn restore_json(value: &mut Value, restorer: &Restorer) {
     match value {
-        Value::String(text) => *text = restore(text, mappings),
+        Value::String(text) => *text = restorer.restore(text),
         Value::Array(values) => {
             for value in values {
-                restore_json(value, mappings);
+                restore_json(value, restorer);
             }
         }
         Value::Object(values) => {
             for value in values.values_mut() {
-                restore_json(value, mappings);
+                restore_json(value, restorer);
             }
         }
         Value::Null | Value::Bool(_) | Value::Number(_) => {}
     }
 }
 
-fn restored_sse(
+/// Partial placeholders held between events.
+///
+/// A provider streams one message a fragment at a time, so a placeholder can
+/// straddle several events. `text` carries a fragment of a raw payload;
+/// `fields` carries one per JSON field path, because an event body is its own
+/// JSON document and the fragment has to rejoin the *same* field of the next
+/// event rather than whichever string happens to come first.
+#[derive(Default)]
+struct StreamCarry {
+    text: RestoreCarry,
+    fields: HashMap<String, RestoreCarry>,
+}
+
+fn restored_lines(
     source: impl Stream<Item = Result<Bytes, reqwest::Error>>,
-    mappings: HashMap<String, String>,
+    restorer: Restorer,
 ) -> impl Stream<Item = Result<Bytes, reqwest::Error>> {
     try_stream! {
         futures_util::pin_mut!(source);
         let mut carry = BytesMut::new();
-        let mut token_carry = String::new();
+        let mut pending = StreamCarry::default();
         while let Some(chunk) = source.next().await {
             carry.extend_from_slice(&chunk?);
             while let Some(newline) = carry.iter().position(|byte| *byte == b'\n') {
@@ -309,8 +321,8 @@ fn restored_sse(
                 match std::str::from_utf8(line) {
                     Ok(_) => {
                         let line = carry.split_to(line_end);
-                        let line = std::str::from_utf8(&line).expect("validated UTF-8 SSE line");
-                        yield Bytes::from(restore_sse_line(line, &mut token_carry, &mappings));
+                        let line = std::str::from_utf8(&line).expect("validated UTF-8 line");
+                        yield Bytes::from(restore_stream_line(line, &mut pending, &restorer));
                     }
                     Err(error) if error.error_len().is_none() => break,
                     Err(_) => {
@@ -323,23 +335,22 @@ fn restored_sse(
             match std::str::from_utf8(&carry) {
                 Ok(_) => {
                     let line = carry.split().freeze();
-                    let line = std::str::from_utf8(&line).expect("validated UTF-8 SSE tail");
-                    yield Bytes::from(restore_sse_line(line, &mut token_carry, &mappings));
+                    let line = std::str::from_utf8(&line).expect("validated UTF-8 tail");
+                    yield Bytes::from(restore_stream_line(line, &mut pending, &restorer));
                 }
                 Err(_) => yield carry.split().freeze(),
             }
         }
-        if !token_carry.is_empty() {
-            yield Bytes::from(std::mem::take(&mut token_carry));
+        // A raw fragment can be emitted as-is; one still held inside a JSON
+        // field has nowhere valid to go, so a stream that ends mid-placeholder
+        // drops those few characters rather than breaking the envelope.
+        if !pending.text.text.is_empty() {
+            yield Bytes::from(std::mem::take(&mut pending.text.text));
         }
     }
 }
 
-fn restore_sse_line(
-    line: &str,
-    token_carry: &mut String,
-    mappings: &HashMap<String, String>,
-) -> String {
+fn restore_stream_line(line: &str, pending: &mut StreamCarry, restorer: &Restorer) -> String {
     let (content, newline) = line
         .strip_suffix('\n')
         .map_or((line, ""), |content| (content, "\n"));
@@ -350,66 +361,97 @@ fn restore_sse_line(
         let (separator, payload) = payload.split_at(separator_len);
         restored.push_str("data:");
         restored.push_str(separator);
-        let payload = if token_carry.is_empty() {
-            payload.to_owned()
-        } else {
-            let mut joined = std::mem::take(token_carry);
-            joined.push_str(payload);
-            joined
-        };
-        restored.push_str(&restore_stream_text(&payload, token_carry, mappings));
+        restored.push_str(&restore_stream_payload(payload, pending, restorer));
+    } else if let Some(payload) = restore_stream_json(content, pending, restorer) {
+        // A bare JSON line, as NDJSON streams send.
+        restored.push_str(&payload);
     } else {
-        if !token_carry.is_empty() {
-            restored.push_str(&std::mem::take(token_carry));
+        if !pending.text.text.is_empty() {
+            restored.push_str(&std::mem::take(&mut pending.text.text));
         }
-        restored.push_str(&restore_stream_text(content, token_carry, mappings));
+        restored.push_str(&restore_stream_text(content, &mut pending.text, restorer));
     }
     restored.push_str(newline);
     restored
 }
 
-fn restore_stream_text(
-    text: &str,
-    token_carry: &mut String,
-    mappings: &HashMap<String, String>,
-) -> String {
-    // Prepend any partial token from the previous chunk
-    let full_text = if token_carry.is_empty() {
-        text.to_owned()
-    } else {
-        let mut combined = std::mem::take(token_carry);
-        combined.push_str(text);
-        combined
-    };
-
-    let mut output = String::with_capacity(full_text.len());
-    let mut cursor = 0;
-
-    while cursor < full_text.len() {
-        let Some(relative) = full_text[cursor..].find('[') else {
-            output.push_str(&full_text[cursor..]);
-            break;
-        };
-        let start = cursor + relative;
-        output.push_str(&full_text[cursor..start]);
-        let tail = &full_text[start..];
-
-        if let Some((token, original)) = mappings
-            .iter()
-            .find(|(token, _)| tail.starts_with(token.as_str()))
-        {
-            output.push_str(original);
-            cursor = start + token.len();
-        } else if mappings.keys().any(|token| token.starts_with(tail)) {
-            token_carry.push_str(tail);
-            break;
-        } else {
-            output.push('[');
-            cursor = start + 1;
-        }
+/// Restore an event payload, preferring the JSON-aware path so a placeholder
+/// split across events is rejoined inside the field that carries it.
+fn restore_stream_payload(payload: &str, pending: &mut StreamCarry, restorer: &Restorer) -> String {
+    if let Some(restored) = restore_stream_json(payload, pending, restorer) {
+        return restored;
     }
 
-    output
+    let payload = if pending.text.text.is_empty() {
+        payload.to_owned()
+    } else {
+        let mut joined = std::mem::take(&mut pending.text.text);
+        joined.push_str(payload);
+        joined
+    };
+    restore_stream_text(&payload, &mut pending.text, restorer)
+}
+
+/// `Some` only when `payload` is a JSON object or array, so plain `data:` text
+/// and SSE sentinels such as `[DONE]` keep the raw-text path.
+fn restore_stream_json(
+    payload: &str,
+    pending: &mut StreamCarry,
+    restorer: &Restorer,
+) -> Option<String> {
+    let trimmed = payload.trim_start();
+    if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
+        return None;
+    }
+    let mut value: Value = serde_json::from_str(payload).ok()?;
+    if !(value.is_object() || value.is_array()) {
+        return None;
+    }
+
+    restore_json_fields(&mut value, &mut String::new(), pending, restorer);
+    serde_json::to_string(&value).ok()
+}
+
+/// Restore every string in an event body, keeping a separate partial
+/// placeholder per field path so fragments rejoin the field they came from.
+fn restore_json_fields(
+    value: &mut Value,
+    path: &mut String,
+    pending: &mut StreamCarry,
+    restorer: &Restorer,
+) {
+    match value {
+        Value::String(text) => {
+            let mut carry = pending.fields.remove(path.as_str()).unwrap_or_default();
+            *text = restore_stream_text(text, &mut carry, restorer);
+            if !carry.text.is_empty() || carry.skip_closing_bracket {
+                pending.fields.insert(path.clone(), carry);
+            }
+        }
+        Value::Array(values) => {
+            for (index, value) in values.iter_mut().enumerate() {
+                let parent = path.len();
+                path.push('.');
+                path.push_str(&index.to_string());
+                restore_json_fields(value, path, pending, restorer);
+                path.truncate(parent);
+            }
+        }
+        Value::Object(values) => {
+            for (key, value) in values.iter_mut() {
+                let parent = path.len();
+                path.push('.');
+                path.push_str(key);
+                restore_json_fields(value, path, pending, restorer);
+                path.truncate(parent);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn restore_stream_text(text: &str, token_carry: &mut RestoreCarry, restorer: &Restorer) -> String {
+    restorer.restore_fragment(text, token_carry)
 }
 
 enum LimitedBodyError {
@@ -435,16 +477,16 @@ async fn collect_limited(
 
 fn restored_text_stream(
     source: impl Stream<Item = Result<Bytes, reqwest::Error>>,
-    mappings: HashMap<String, String>,
+    restorer: Restorer,
 ) -> impl Stream<Item = Result<Bytes, reqwest::Error>> {
     try_stream! {
         futures_util::pin_mut!(source);
-        let mut token_carry = String::new();
+        let mut token_carry = RestoreCarry::default();
         while let Some(chunk) = source.next().await {
             let bytes = chunk?;
             match std::str::from_utf8(&bytes) {
                 Ok(text) => {
-                    let restored = restore_stream_text(text, &mut token_carry, &mappings);
+                    let restored = restore_stream_text(text, &mut token_carry, &restorer);
                     yield Bytes::from(restored);
                 }
                 Err(_) => {
@@ -454,8 +496,8 @@ fn restored_text_stream(
             }
         }
         // Flush any remaining partial token
-        if !token_carry.is_empty() {
-            yield Bytes::from(std::mem::take(&mut token_carry));
+        if !token_carry.text.is_empty() {
+            yield Bytes::from(std::mem::take(&mut token_carry.text));
         }
     }
 }
@@ -486,6 +528,12 @@ fn is_json(content_type: &str) -> bool {
 
 fn is_event_stream(content_type: &str) -> bool {
     content_type.eq_ignore_ascii_case("text/event-stream")
+}
+
+/// Newline-delimited JSON, as Ollama and several other providers stream.
+fn is_ndjson(content_type: &str) -> bool {
+    content_type.eq_ignore_ascii_case("application/x-ndjson")
+        || content_type.eq_ignore_ascii_case("application/ndjson")
 }
 
 fn connection_headers(headers: &HeaderMap) -> HashSet<HeaderName> {
@@ -524,13 +572,10 @@ fn json_error(status: StatusCode, message: impl Into<String>) -> Response<Body> 
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use tokio::net::TcpListener;
     use tower::ServiceExt;
 
     use super::*;
-    use crate::vault::VaultConfig;
 
     const PROMPT: &str = "Email Alice Johnson at alice@example.com";
 
@@ -543,10 +588,6 @@ mod tests {
             target.parse().expect("valid target URL"),
             reqwest::Client::new(),
             Arc::new(Detector::default()),
-            Arc::new(MemoryVault::new(VaultConfig {
-                ttl: Duration::from_secs(60),
-                max_entries: 100,
-            })),
             1024 * 1024,
             upstream_auth.map(|(name, value)| {
                 (
@@ -688,7 +729,7 @@ mod tests {
         assert_eq!(mappings.len(), 2);
 
         let mut restored: Value = serde_json::from_slice(&anonymized).expect("valid JSON");
-        restore_json(&mut restored, &mappings);
+        restore_json(&mut restored, &Restorer::new(&mappings));
         assert_eq!(restored, body);
     }
 
@@ -708,9 +749,9 @@ mod tests {
             &token[..split],
             &token[split..]
         );
-        let stream = restored_sse(
+        let stream = restored_lines(
             futures_util::stream::iter([Ok(Bytes::from(event))]),
-            anonymized.mappings,
+            Restorer::new(&anonymized.mappings),
         );
         futures_util::pin_mut!(stream);
 
@@ -729,22 +770,109 @@ mod tests {
     fn stream_restore_leaves_unknown_and_partial_tokens_unchanged() {
         let mappings =
             HashMap::from([(String::from("[EMAIL_0123456789ab]"), String::from("known"))]);
-        let mut carry = String::new();
+        let mut carry = RestoreCarry::default();
 
         assert_eq!(
-            restore_stream_text("unknown [EMAIL_ffffffffffff]", &mut carry, &mappings),
+            restore_stream_text(
+                "unknown [EMAIL_ffffffffffff]",
+                &mut carry,
+                &Restorer::new(&mappings)
+            ),
             "unknown [EMAIL_ffffffffffff]"
         );
         assert_eq!(
-            restore_stream_text("[EMAIL_0123", &mut carry, &mappings),
+            restore_stream_text("[EMAIL_0123", &mut carry, &Restorer::new(&mappings)),
             ""
         );
-        assert_eq!(carry, "[EMAIL_0123");
-        let mut second = std::mem::take(&mut carry);
+        assert_eq!(carry.text, "[EMAIL_0123");
+        let mut second = std::mem::take(&mut carry.text);
         second.push_str("456789ab]");
-        assert_eq!(restore_stream_text(&second, &mut carry, &mappings), "known");
-        assert!(carry.is_empty());
+        assert_eq!(
+            restore_stream_text(&second, &mut carry, &Restorer::new(&mappings)),
+            "known"
+        );
+        assert!(carry.text.is_empty());
     }
+    #[tokio::test]
+    async fn streamed_uppercase_text_is_not_dropped() {
+        let mappings = HashMap::from([(
+            "[EMAIL_0123456789ab]".to_owned(),
+            "alice@example.com".to_owned(),
+        )]);
+        let lines = ["USA", "DONE", "STATUS_OK"].map(|text| {
+            Ok(Bytes::from(
+                json!({"message": {"content": text}, "done": false}).to_string() + "\n",
+            ))
+        });
+        let stream = restored_lines(futures_util::stream::iter(lines), Restorer::new(&mappings));
+        futures_util::pin_mut!(stream);
+
+        let mut content = String::new();
+        while let Some(chunk) = stream.next().await {
+            let bytes = chunk.expect("chunk");
+            for line in String::from_utf8(bytes.to_vec()).expect("utf-8").lines() {
+                let value: Value = serde_json::from_str(line).expect("valid NDJSON");
+                content.push_str(value["message"]["content"].as_str().expect("content"));
+            }
+        }
+
+        assert_eq!(content, "USADONESTATUS_OK");
+    }
+
+    #[test]
+    fn restores_mangled_hash_across_every_fragment_split() {
+        let mappings = HashMap::from([(
+            "[EMAIL_0123456789ab]".to_owned(),
+            "alice@example.com".to_owned(),
+        )]);
+        let restorer = Restorer::new(&mappings);
+
+        for variant in ["EMAIL_0123456789ab", "CONTACT:0123456789ab", "0123456789AB"] {
+            for split in 1..variant.len() {
+                let mut carry = RestoreCarry::default();
+                let mut output = restore_stream_text(&variant[..split], &mut carry, &restorer);
+                output.push_str(&restore_stream_text(
+                    &variant[split..],
+                    &mut carry,
+                    &restorer,
+                ));
+                output.push_str(&carry.text);
+                assert_eq!(
+                    output, "alice@example.com",
+                    "failed for {variant} at {split}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn restores_mangled_hash_split_across_ndjson_fields() {
+        let mappings = HashMap::from([(
+            "[EMAIL_0123456789ab]".to_owned(),
+            "alice@example.com".to_owned(),
+        )]);
+        let mutated = "EMAIL_0123456789AB";
+        let lines = mutated.chars().map(|character| {
+            Ok(Bytes::from(
+                json!({"message": {"content": character.to_string()}, "done": false}).to_string()
+                    + "\n",
+            ))
+        });
+        let stream = restored_lines(futures_util::stream::iter(lines), Restorer::new(&mappings));
+        futures_util::pin_mut!(stream);
+
+        let mut content = String::new();
+        while let Some(chunk) = stream.next().await {
+            let bytes = chunk.expect("chunk");
+            for line in String::from_utf8(bytes.to_vec()).expect("utf-8").lines() {
+                let value: Value = serde_json::from_str(line).expect("valid NDJSON");
+                content.push_str(value["message"]["content"].as_str().expect("content"));
+            }
+        }
+
+        assert_eq!(content, "alice@example.com");
+    }
+
     #[tokio::test]
     async fn restores_sse_across_arbitrary_chunk_boundaries() {
         let detector = Detector::default();
@@ -757,7 +885,11 @@ mod tests {
             Ok(Bytes::from(event[..split].to_owned())),
             Ok(Bytes::from(event[split..].to_owned())),
         ];
-        let stream = restored_sse(futures_util::stream::iter(chunks), anonymized.mappings);
+        let stream = restored_lines(
+            futures_util::stream::iter(chunks),
+            Restorer::new(&anonymized.mappings),
+        );
+
         futures_util::pin_mut!(stream);
 
         let mut output = String::new();
@@ -839,8 +971,22 @@ mod tests {
         );
     }
 
+    /// Upstream that ignores the request and always answers with `body`, so a
+    /// test can assert on output the client never sent.
+    async fn fixed_upstream(content_type: &'static str, body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bound port");
+        let address = listener.local_addr().expect("local address");
+        let app = Router::new()
+            .fallback(move || async move { ([(header::CONTENT_TYPE, content_type)], body) });
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("upstream serves");
+        });
+
+        format!("http://{address}")
+    }
+
     #[tokio::test]
-    async fn token_restores_across_different_requests() {
+    async fn token_from_a_previous_request_is_not_restored() {
         let target = echo_upstream("application/json").await;
         let state = state(&target);
         let original = "alice@example.com";
@@ -858,6 +1004,8 @@ mod tests {
         let response = app.clone().oneshot(stored).await.expect("first response");
         assert!(body_text(response).await.contains(original));
 
+        // A later request carrying only the placeholder has no mapping of its
+        // own, so the earlier request's value must not reappear.
         let follow_up = Request::builder()
             .method("POST")
             .uri("/v1/messages")
@@ -866,9 +1014,105 @@ mod tests {
                 serde_json::to_vec(&json!({"content": token})).expect("serialized body"),
             ))
             .expect("built request");
-        let response = app.oneshot(follow_up).await.expect("second response");
+        let seen = body_text(app.oneshot(follow_up).await.expect("second response")).await;
 
-        assert!(body_text(response).await.contains(original));
+        assert!(!seen.contains(original), "{seen}");
+        assert!(seen.contains(&token), "{seen}");
+    }
+
+    #[tokio::test]
+    async fn model_invented_values_reach_the_client_unchanged() {
+        const INVENTED: &str =
+            r#"{"content":"Contact Dana Whitfield at dana@example.org or 415-555-0142"}"#;
+        let target = fixed_upstream("application/json", INVENTED).await;
+
+        let seen = body_text(
+            router(state(&target))
+                .oneshot(messages_request())
+                .await
+                .expect("proxied response"),
+        )
+        .await;
+
+        assert_eq!(seen, INVENTED);
+    }
+
+    #[tokio::test]
+    async fn unknown_placeholder_in_response_is_left_alone() {
+        const UNKNOWN: &str = r#"{"content":"[EMAIL_ffffffffffff] and [NAME_0123456789ab]"}"#;
+        let target = fixed_upstream("application/json", UNKNOWN).await;
+
+        let seen = body_text(
+            router(state(&target))
+                .oneshot(messages_request())
+                .await
+                .expect("proxied response"),
+        )
+        .await;
+
+        assert_eq!(seen, UNKNOWN);
+    }
+
+    #[tokio::test]
+    async fn streamed_response_restores_only_this_requests_placeholders() {
+        let detector = Detector::default();
+        let anonymized = detector.anonymize("mail alice@example.com");
+        let token = anonymized
+            .mappings
+            .keys()
+            .next()
+            .expect("email token")
+            .clone();
+        const FOREIGN: &str = "[EMAIL_ffffffffffff]";
+        let event = format!("data: {{\"text\":\"{token} {FOREIGN}\"}}\n\n");
+
+        let stream = restored_lines(
+            futures_util::stream::iter([Ok(Bytes::from(event))]),
+            Restorer::new(&anonymized.mappings),
+        );
+        futures_util::pin_mut!(stream);
+
+        let mut output = String::new();
+        while let Some(chunk) = stream.next().await {
+            output.push_str(std::str::from_utf8(&chunk.expect("chunk")).expect("utf-8"));
+        }
+
+        assert!(output.contains("alice@example.com"), "{output}");
+        assert!(output.contains(FOREIGN), "{output}");
+    }
+
+    #[tokio::test]
+    async fn restores_placeholder_split_across_ndjson_fields() {
+        let detector = Detector::default();
+        let anonymized = detector.anonymize("mail alice@example.com");
+        let token = anonymized
+            .mappings
+            .keys()
+            .next()
+            .expect("email token")
+            .clone();
+        let lines = token.chars().map(|character| {
+            Ok(Bytes::from(
+                json!({"message": {"content": character.to_string()}, "done": false}).to_string()
+                    + "\n",
+            ))
+        });
+        let stream = restored_lines(
+            futures_util::stream::iter(lines),
+            Restorer::new(&anonymized.mappings),
+        );
+        futures_util::pin_mut!(stream);
+
+        let mut content = String::new();
+        while let Some(chunk) = stream.next().await {
+            let bytes = chunk.expect("chunk");
+            for line in String::from_utf8(bytes.to_vec()).expect("utf-8").lines() {
+                let value: Value = serde_json::from_str(line).expect("valid NDJSON");
+                content.push_str(value["message"]["content"].as_str().expect("content"));
+            }
+        }
+
+        assert_eq!(content, "alice@example.com");
     }
 
     #[tokio::test]

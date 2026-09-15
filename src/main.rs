@@ -4,7 +4,6 @@ use anyhow::Context;
 use gatekeeper::config::Config;
 use gatekeeper::detector::Detector;
 use gatekeeper::proxy::{ProxyState, router};
-use gatekeeper::vault::MemoryVault;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
@@ -14,12 +13,10 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::from_env().context("invalid Gatekeeper configuration")?;
     let detector = Arc::new(Detector::default());
-    let vault = Arc::new(MemoryVault::new(config.vault));
     let state = ProxyState::new(
         config.target_url,
         reqwest::Client::new(),
         detector,
-        vault,
         config.max_body_bytes,
         config.upstream_auth,
     );

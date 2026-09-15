@@ -1,15 +1,10 @@
 use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::time::Duration;
 
 use http::header::{HeaderName, HeaderValue};
 use url::Url;
 
-use crate::vault::VaultConfig;
-
 const DEFAULT_LISTEN_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8080);
-const DEFAULT_VAULT_TTL_SECS: u64 = 30 * 60;
-const DEFAULT_MAX_ENTRIES: usize = 100_000;
 const DEFAULT_MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 const DEFAULT_UPSTREAM_AUTH_HEADER: &str = "x-api-key";
 
@@ -17,7 +12,6 @@ const DEFAULT_UPSTREAM_AUTH_HEADER: &str = "x-api-key";
 pub struct Config {
     pub listen_addr: SocketAddr,
     pub target_url: Url,
-    pub vault: VaultConfig,
     pub max_body_bytes: usize,
     /// Credential injected on every proxied request, replacing whatever the
     /// client sent. `None` forwards the client's own auth headers unchanged.
@@ -31,18 +25,12 @@ impl Config {
             .unwrap_or_else(|_| "http://127.0.0.1:11434".to_owned())
             .parse()
             .map_err(ConfigError::TargetUrl)?;
-        let ttl_secs = parse_env("GATEKEEPER_VAULT_TTL_SECS", DEFAULT_VAULT_TTL_SECS)?;
-        let max_entries = parse_env("GATEKEEPER_MAX_ENTRIES", DEFAULT_MAX_ENTRIES)?;
         let max_body_bytes = parse_env("GATEKEEPER_MAX_BODY_BYTES", DEFAULT_MAX_BODY_BYTES)?;
         let upstream_auth = upstream_auth()?;
 
         Ok(Self {
             listen_addr,
             target_url,
-            vault: VaultConfig {
-                ttl: Duration::from_secs(ttl_secs),
-                max_entries,
-            },
             max_body_bytes,
             upstream_auth,
         })
