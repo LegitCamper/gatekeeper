@@ -47,6 +47,17 @@ impl ProxyState {
     }
 }
 
+/// Builds the provider-facing client without following redirects.
+///
+/// Redirects must reach the caller unchanged. Following one inside Gatekeeper
+/// could turn an Anthropic or OpenAI `POST` into a bodyless `GET`, hiding the
+/// original provider response behind an unrelated `200` response.
+pub fn upstream_client() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+}
+
 pub fn router(state: ProxyState) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -212,6 +223,10 @@ async fn upstream_response(
     let response_connection_headers = connection_headers(&headers);
     let response_type = content_type(&headers).map(str::to_owned);
 
+    if status.is_redirection() {
+        tracing::warn!(%status, "forwarding upstream redirect without following it");
+    }
+
     tracing::debug!(
         "upstream_response: content-type={:?}, mappings={}",
         response_type,
@@ -219,8 +234,24 @@ async fn upstream_response(
     );
 
     let restorer = Restorer::new(&mappings);
+    // Gatekeeper asked for `identity`, but an upstream is free to ignore that.
+    // Compressed bytes cannot be restored, and re-framing them line by line
+    // could corrupt the payload, so hand back exactly what arrived.
+    let compressed = headers
+        .get_all(header::CONTENT_ENCODING)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|value| !value.trim().eq_ignore_ascii_case("identity"));
     let body = if mappings.is_empty() {
         // No tokens to restore, pass through as-is
+        Body::from_stream(upstream.bytes_stream())
+    } else if compressed {
+        tracing::warn!(
+            content_type = ?response_type,
+            mappings = mappings.len(),
+            "upstream compressed a response despite the identity request; \
+             placeholders in it cannot be restored"
+        );
         Body::from_stream(upstream.bytes_stream())
     } else if response_type.as_deref().is_some_and(is_json) {
         let bytes = match collect_limited(upstream.bytes_stream(), state.max_body_bytes).await {
@@ -241,25 +272,39 @@ async fn upstream_response(
                 );
             }
         };
-        let mut value: Value = match serde_json::from_slice(&bytes) {
-            Ok(value) => value,
-            Err(error) => {
-                return json_error(
-                    StatusCode::BAD_GATEWAY,
-                    format!("invalid JSON upstream response: {error}"),
-                );
+        match serde_json::from_slice::<Value>(&bytes) {
+            Ok(mut value) => {
+                restore_json(&mut value, &restorer);
+                tracing::debug!("restored JSON response");
+                match serde_json::to_vec(&value) {
+                    Ok(value) => Body::from(value),
+                    Err(error) => {
+                        return json_error(
+                            StatusCode::BAD_GATEWAY,
+                            format!("failed to encode upstream response: {error}"),
+                        );
+                    }
+                }
             }
-        };
-        restore_json(&mut value, &restorer);
-        tracing::debug!("restored JSON response");
-        match serde_json::to_vec(&value) {
-            Ok(value) => Body::from(value),
-            Err(error) => {
-                return json_error(
-                    StatusCode::BAD_GATEWAY,
-                    format!("failed to encode upstream response: {error}"),
-                );
-            }
+            Err(error) => match std::str::from_utf8(&bytes) {
+                Ok(text) => {
+                    tracing::warn!(
+                        %error,
+                        %status,
+                        content_type = ?response_type,
+                        bytes = bytes.len(),
+                        mappings = mappings.len(),
+                        "upstream response claims JSON but does not parse; restoring as text"
+                    );
+                    Body::from(restorer.restore(text))
+                }
+                Err(_) => {
+                    return json_error(
+                        StatusCode::BAD_GATEWAY,
+                        "upstream response is not text, so redaction placeholders cannot be restored",
+                    );
+                }
+            },
         }
     } else if response_type
         .as_deref()
@@ -439,10 +484,10 @@ fn restore_stream_line(line: &str, pending: &mut StreamCarry, restorer: &Restore
         // A bare JSON line, as NDJSON streams send.
         restored.push_str(&payload);
     } else {
-        if !pending.text.text.is_empty() {
-            restored.push_str(&std::mem::take(&mut pending.text.text));
-        }
-        restored.push_str(&restore_stream_text(content, &mut pending.text, restorer));
+        // SSE metadata and event delimiters are protocol framing, not model text.
+        // Feeding them through fragment restoration can hold a trailing hex letter
+        // as a possible digest prefix and corrupt names such as `message_delta`.
+        restored.push_str(content);
     }
     restored.push_str(newline);
     restored
@@ -584,7 +629,21 @@ fn target_url(base: &Url, uri: &axum::http::Uri) -> Result<Url, url::ParseError>
     let path_and_query = uri
         .path_and_query()
         .map_or_else(|| uri.path(), axum::http::uri::PathAndQuery::as_str);
-    Url::parse(&format!("{origin}{base_path}{path_and_query}"))
+    // A query on TARGET_URL belongs to the upstream, not to the caller: an
+    // Azure-style gateway base such as `…?api-version=2024-02-01` stops working
+    // if forwarding drops it. Caller parameters come first, upstream ones after.
+    let target = match base.query().filter(|query| !query.is_empty()) {
+        Some(base_query) => {
+            let separator = if path_and_query.contains('?') {
+                '&'
+            } else {
+                '?'
+            };
+            format!("{origin}{base_path}{path_and_query}{separator}{base_query}")
+        }
+        None => format!("{origin}{base_path}{path_and_query}"),
+    };
+    Url::parse(&target)
 }
 
 fn content_type(headers: &HeaderMap) -> Option<&str> {
@@ -684,7 +743,7 @@ mod tests {
     fn state_with_auth(target: &str, upstream_auth: Option<(&str, &str)>) -> ProxyState {
         ProxyState::new(
             target.parse().expect("valid target URL"),
-            reqwest::Client::new(),
+            upstream_client().expect("upstream client"),
             Arc::new(Detector::default()),
             1024 * 1024,
             upstream_auth.map(|(name, value)| {
@@ -803,6 +862,46 @@ mod tests {
 
         assert!(seen.contains("identity"), "{seen}");
         assert!(!seen.contains("gzip"), "{seen}");
+    }
+
+    #[test]
+    fn query_on_the_upstream_base_url_survives_forwarding() {
+        let base = Url::parse("https://gateway.example/api?api-version=2024-02-01").expect("base");
+        let without_query =
+            target_url(&base, &"/v1/messages".parse().expect("uri")).expect("target");
+        assert_eq!(
+            without_query.as_str(),
+            "https://gateway.example/api/v1/messages?api-version=2024-02-01"
+        );
+
+        let with_query = target_url(&base, &"/v1/messages?beta=1&count=2".parse().expect("uri"))
+            .expect("target");
+        assert_eq!(
+            with_query.as_str(),
+            "https://gateway.example/api/v1/messages?beta=1&count=2&api-version=2024-02-01"
+        );
+    }
+
+    #[test]
+    fn path_and_query_survive_a_trailing_slash_on_the_base_url() {
+        let base = Url::parse("http://localhost:11434/").expect("base");
+        let target = target_url(&base, &"/v1/models?x=1".parse().expect("uri")).expect("target");
+
+        assert_eq!(target.as_str(), "http://localhost:11434/v1/models?x=1");
+        assert_eq!(target.query(), Some("x=1"));
+    }
+
+    /// What "same path upstream" does *not* cover: `Url` applies the WHATWG URL
+    /// algorithm, so dot segments collapse and `%2e` decodes on the way through.
+    /// Every conforming HTTP client normalizes the same way; pinning it here
+    /// keeps the README claim honest.
+    #[test]
+    fn dot_segments_are_normalized_the_way_a_url_parser_normalizes_them() {
+        let base = Url::parse("http://localhost:11434").expect("base");
+        let target =
+            target_url(&base, &"/v1/chat/../messages".parse().expect("uri")).expect("target");
+
+        assert_eq!(target.path(), "/v1/messages");
     }
 
     #[test]

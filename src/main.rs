@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use gatekeeper::config::Config;
 use gatekeeper::detector::Detector;
-use gatekeeper::proxy::{ProxyState, router};
+use gatekeeper::proxy::{ProxyState, router, upstream_client};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
@@ -15,7 +15,7 @@ async fn main() -> anyhow::Result<()> {
     let detector = Arc::new(Detector::default().with_redactions(&config.redactions));
     let state = ProxyState::new(
         config.target_url,
-        reqwest::Client::new(),
+        upstream_client().context("failed to build upstream HTTP client")?,
         detector,
         config.max_body_bytes,
         config.upstream_auth,

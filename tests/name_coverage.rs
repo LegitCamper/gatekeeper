@@ -30,6 +30,16 @@ fn explicit_person_context_covers_reported_names() {
         ("my name is María José García", "María José García"),
         ("my name is alice johnson and I called", "alice johnson"),
         ("My name is Alice.", "Alice"),
+        ("name: Zephyr Quixotic", "Zephyr Quixotic"),
+        ("Mr. Hiroshi Tanaka", "Hiroshi Tanaka"),
+        ("Mrs. Priya Sharma", "Priya Sharma"),
+        ("Ms. ALICE JOHNSON", "ALICE JOHNSON"),
+        ("Dr. alice johnson", "alice johnson"),
+        ("attn: Zephyr Quixotic", "Zephyr Quixotic"),
+        ("cc: Zephyr Quixotic", "Zephyr Quixotic"),
+        ("contact Zephyr Quixotic", "Zephyr Quixotic"),
+        ("signed, Zephyr Quixotic", "Zephyr Quixotic"),
+        ("sincerely, Zephyr Quixotic", "Zephyr Quixotic"),
         ("Alice Johnson", "Alice Johnson"),
     ] {
         assert_eq!(names(text), [expected], "missed or split: {text:?}");

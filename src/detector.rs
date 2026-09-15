@@ -109,8 +109,8 @@ const TOKEN_DECORATION_LABELS: &[&str] = &[
 /// follows it.
 const GIVEN_NAMES: &str = include_str!("given_names.txt");
 
-/// Words that introduce a person, letting a `Capitalized Capitalized` pair be
-/// reported even when the given name is absent from [`GIVEN_NAMES`].
+/// Words that introduce a person, letting a multi-word name be reported even
+/// when the given name is absent from [`GIVEN_NAMES`] or is not title-cased.
 ///
 /// Deliberately excludes `to` and `from`: they precede a capitalized pair far
 /// too often in ordinary prose ("from Redis Cluster", "to New York"), and a
@@ -565,8 +565,8 @@ impl Detector {
         format!("[{}_{:012x}]", kind.label(), digest & 0xffff_ffff_ffff)
     }
 
-    /// Dictionary given name, optionally followed by capitalized words (middle name, surname).
-    /// Reports single first names or multi-word name sequences.
+    /// Dictionary given name followed by one to three capitalized surname words.
+    /// Bare dictionary first names stay untouched unless an explicit context matches.
     fn dictionary_names(&self, text: &str) -> Vec<Detection> {
         let bytes = text.as_bytes();
         let mut found = Vec::new();
