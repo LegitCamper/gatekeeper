@@ -8,6 +8,8 @@ Gatekeeper is a Rust/Axum reverse proxy that removes sensitive values before LLM
 - Handles bare 10- and 11-digit, leading-`+`, dashed/dotted/parenthesized, international, and Vietnamese phone formats. Placeholder numbers such as `000-000-0000` are redacted too, so an undialable number in a prompt is still removed.
 - Detects person names from a ~19k-entry multi-origin given-name dictionary, plus any capitalized pair after a trigger word (`contact`, `cc:`, `regards,`, `Mr.`, `my name is`). Entries colliding with ordinary English words are excluded, and calendar/direction words are denied, so capitalized technical prose ("New York", "Redis Cluster", "Docker Compose") is left intact.
 - Redacts outbound requests only. Response text is never scanned, so a name, number, or address the model invents reaches the client exactly as written.
+- Redacts home-directory paths down to the account name: `/home/<user>`, `/var/home/<user>`, and `/Users/<user>` become one `PATH` token, so the username goes and the rest of the path (`/projects/gatekeeper/src`) stays readable for the model and restorable for the client.
+- Redacts whatever you list in `GATEKEEPER_REDACT`, plus optionally this machine's login and host name — see [Custom redaction](#custom-redaction).
 - Denies outbound tool calls that read `.env`, `.pem`, or `.key` files, so private configuration and key material cannot be handed to a provider. Writes and `.env.example` are unaffected. See [`.env` read guard](#env-read-guard).
 - Restores tokens in JSON, Server-Sent Event, and other streamed responses, including tokens split across chunks. Restoration keys on the request-local 12-hex digest, so common model changes to token prefixes, brackets, separators, or hex case still restore the original value.
 - Proxies provider headers and payloads without translating Anthropic/OpenAI schemas.
@@ -34,7 +36,50 @@ provider:
   unknown tools are denied on a match.
 - The guard only reads outbound requests. Responses and tool results are never
   blocked or rewritten, and prose mentioning `.env` outside an invocation is left
-  alone. The `403` body names the protected file and nothing else.
+  alone. The `403` body names the protected file's basename and nothing else — no
+  path, no request body.
+
+Gatekeeper's own refusals use the provider error shape, so a client or a model
+relaying the failure shows a reason instead of an opaque transport error:
+
+```json
+{
+  "type": "error",
+  "error": {
+    "type": "gatekeeper_security_error",
+    "message": "Gatekeeper blocked this request over security concerns: reading .env would send its contents to the model provider"
+  }
+}
+```
+
+`error.type` is `gatekeeper_security_error` for a policy refusal and
+`gateway_error` for everything else Gatekeeper rejects itself (oversized body,
+bad request JSON, unreachable upstream), so callers can branch on the difference.
+
+## Custom redaction
+
+```bash
+# Literal values, comma-separated, matched case-insensitively and whole-word.
+export GATEKEEPER_REDACT='acme-corp,Project Chimney'
+# Also redact this machine's login name and host name, read at startup so they
+# never have to be written into an env file. `user`, `host`, or both.
+export GATEKEEPER_REDACT_IDENTITY=user,host
+```
+
+Both land in the same `CUSTOM` token class and round-trip like any other value.
+Limits worth knowing:
+
+- Values are literals, not regexes: `12.34` blanks only that string, never every
+  two-digit-dot-two-digit number. Pattern support is the obvious next step if a
+  case for it shows up.
+- A value with a comma cannot be expressed, and one- or two-character values are
+  dropped as noise.
+- `GATEKEEPER_REDACT_IDENTITY` skips names that are ordinary words (`root`,
+  `admin`, `node`, `localhost`, …) and logs why — blanking those would mangle more
+  text than it hides. Force one by listing it in `GATEKEEPER_REDACT`.
+- Home-directory paths need no configuration at all: `/home/<user>`,
+  `/var/home/<user>`, and `/Users/<user>` are always tokenized. `/root` is not,
+  since it names a standard account rather than a person.
 
 ## Run
 
@@ -97,6 +142,8 @@ No session header is required: restoration is scoped to the request itself. Use 
 | `UPSTREAM_API_KEY` | unset | Upstream credential, injected in place of the client's. Falls back to `ANTHROPIC_API_KEY` |
 | `UPSTREAM_AUTH_HEADER` | `x-api-key` | Header carrying it. Use `authorization` for Bearer gateways and include the `Bearer ` prefix in the value |
 | `GATEKEEPER_MAX_BODY_BYTES` | `10485760` | Maximum buffered request/JSON response body |
+| `GATEKEEPER_REDACT` | unset | Comma-separated literal values to redact as `CUSTOM`, matched case-insensitively and whole-word |
+| `GATEKEEPER_REDACT_IDENTITY` | unset | `user`, `host`, or both: redact this machine's login name and hostname, read at startup |
 | `RUST_LOG` | `info` | Tracing filter |
 
 ## Development

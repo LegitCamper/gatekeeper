@@ -23,6 +23,10 @@ pub enum Kind {
     Phone,
     Address,
     Name,
+    /// Home-directory path: the account name is the path segment after `/home`.
+    Path,
+    /// Value supplied through `GATEKEEPER_REDACT` / `GATEKEEPER_REDACT_IDENTITY`.
+    Custom,
 }
 
 impl Kind {
@@ -38,6 +42,8 @@ impl Kind {
             Self::Phone => "PHONE",
             Self::Address => "ADDRESS",
             Self::Name => "NAME",
+            Self::Path => "PATH",
+            Self::Custom => "CUSTOM",
         }
     }
 
@@ -52,7 +58,11 @@ impl Kind {
             Self::Dob => 5,
             Self::Phone => 6,
             Self::Address => 7,
-            Self::Name => 8,
+            Self::Path => 8,
+            Self::Name => 9,
+            // Configured last: a custom value overlapping a real credential or
+            // address must not be the only thing tokenized.
+            Self::Custom => 10,
         }
     }
 }
@@ -86,6 +96,8 @@ const TOKEN_DECORATION_LABELS: &[&str] = &[
     "PHONE",
     "ADDRESS",
     "NAME",
+    "PATH",
+    "CUSTOM",
     "CONTACT",
     "REDACTED",
 ];
@@ -181,6 +193,9 @@ const NAME_DENY: &[&str] = &[
 pub struct Detector {
     patterns: Vec<(Kind, Regex)>,
     given_names: AhoCorasick,
+    /// Configured literal values (login names, internal identifiers) reported as
+    /// [`Kind::Custom`]. `None` until [`Detector::with_redactions`] adds them.
+    custom: Option<AhoCorasick>,
     tokens: RandomState,
 }
 
@@ -287,6 +302,14 @@ impl Default for Detector {
                 .expect("address pattern is valid"),
             ),
             (
+                // Home directories carry the account name in the segment right
+                // after `home`, so the whole `/home/<user>` prefix is tokenized
+                // and the rest of the path stays readable for the model.
+                Kind::Path,
+                Regex::new(r#"(?:/(?:var/)?home|/Users)/[^/\s"'`]+"#)
+                    .expect("home path pattern is valid"),
+            ),
+            (
                 // Strong identity/title context permits three title-cased words
                 // for names such as `María José García`.
                 Kind::Name,
@@ -361,12 +384,36 @@ impl Default for Detector {
         Self {
             patterns,
             given_names,
+            custom: None,
             tokens: RandomState::new(),
         }
     }
 }
 
 impl Detector {
+    /// Add literal values to redact on top of the built-in patterns, reported as
+    /// [`Kind::Custom`]. Matching is case-insensitive and whole-word, so `acme`
+    /// catches `Acme` but not `pacman`. Values shorter than two characters are
+    /// dropped: a one-character "redaction" would fire on every other token.
+    #[must_use]
+    pub fn with_redactions(mut self, values: &[String]) -> Self {
+        let literals: Vec<String> = values
+            .iter()
+            .map(|value| value.trim())
+            .filter(|value| value.chars().count() > 1)
+            .map(str::to_owned)
+            .collect();
+        if !literals.is_empty() {
+            self.custom = Some(
+                AhoCorasick::builder()
+                    .match_kind(MatchKind::LeftmostLongest)
+                    .ascii_case_insensitive(true)
+                    .build(literals)
+                    .expect("literal redactions are valid"),
+            );
+        }
+        self
+    }
     /// Find every supported value in `text`, resolving overlaps by category
     /// priority and then by span length. Results are ordered by position.
     pub fn scan(&self, text: &str) -> Vec<Detection> {
@@ -390,7 +437,32 @@ impl Detector {
         }
 
         candidates.extend(self.dictionary_names(text));
+        candidates.extend(self.custom_literals(text));
         resolve(candidates)
+    }
+
+    /// Configured literal values, matched whole: `acme` fires in `Acme Corp` but
+    /// not in `pacman`, so an operator cannot blank out ordinary prose by typing
+    /// a short fragment.
+    fn custom_literals(&self, text: &str) -> Vec<Detection> {
+        let Some(custom) = &self.custom else {
+            return Vec::new();
+        };
+
+        custom
+            .find_iter(text)
+            .filter(|found| {
+                let word = |c: char| c.is_alphanumeric() || c == '_';
+                !text[..found.start()].chars().next_back().is_some_and(word)
+                    && !text[found.end()..].chars().next().is_some_and(word)
+            })
+            .map(|found| Detection {
+                kind: Kind::Custom,
+                value: text[found.start()..found.end()].to_owned(),
+                start: found.start(),
+                end: found.end(),
+            })
+            .collect()
     }
 
     /// Replace every detected value with an opaque token, returning the token
@@ -915,6 +987,26 @@ fn validate(kind: Kind, text: &str, start: usize, end: usize) -> Option<(usize, 
             .ok()
             .filter(|address| !(address.is_loopback() || address.is_unspecified()))
             .map(|_| (start, end)),
+        Kind::Path => {
+            // `./home/../bin` is a relative path, not an account: judge the
+            // segment as matched, before any trimming.
+            let segment = text[start..end].rsplit('/').next().unwrap_or("");
+            if segment.is_empty() || segment.chars().all(|c| c == '.') {
+                return None;
+            }
+            // The greedy last segment also swallows sentence punctuation and
+            // markdown, so `fix /home/sawyer.` must not map a token to a trailing
+            // period. Interior dots (`/home/j.doe`) are safe: only the tail goes.
+            let mut end = end;
+            while end > start {
+                let last = text[..end].chars().next_back().unwrap_or('\0');
+                if last.is_alphanumeric() || matches!(last, '_' | '-') {
+                    break;
+                }
+                end -= last.len_utf8();
+            }
+            (end > start).then_some((start, end))
+        }
         Kind::Phone => {
             let preceded_by_word = start > 0 && is_word_byte(text.as_bytes()[start - 1]);
             if preceded_by_word {
@@ -1214,6 +1306,64 @@ mod tests {
         assert!(kinds(&detector, "count 12345 items").is_empty());
         // A bare dictionary name without a surname stays untouched.
         assert!(kinds(&detector, "grace under pressure, Grace").is_empty());
+    }
+
+    #[test]
+    fn home_paths_lose_the_account_name_and_keep_the_rest() {
+        let detector = Detector::default();
+
+        // The username is the leak; the path below it is ordinary context.
+        for text in [
+            "edit /home/sawyer/.bashrc please",
+            "edit /var/home/sawyer/.bashrc please",
+            "edit /Users/Sawyer/.bashrc please",
+        ] {
+            let anonymized = detector.anonymize(text);
+            assert!(
+                !anonymized.text.contains("sawyer") && !anonymized.text.contains("Sawyer"),
+                "leaked the account name: {}",
+                anonymized.text
+            );
+            assert!(anonymized.text.contains("/.bashrc"), "{anonymized:?}");
+            assert_eq!(restore(&anonymized.text, &anonymized.mappings), text);
+        }
+
+        // Trailing punctuation stays outside the token, so the sentence survives.
+        assert_eq!(
+            values(&detector, "fix /home/sawyer."),
+            ["/home/sawyer".to_owned()]
+        );
+        // A relative path names no account.
+        assert!(kinds(&detector, "run ./home/../bin/tool").is_empty());
+    }
+
+    #[test]
+    fn configured_literals_are_redacted_whole_word() {
+        let configured = ["acme-corp".to_owned(), "Quentin Farsworth".to_owned()];
+        let detector = Detector::default().with_redactions(&configured);
+
+        let anonymized = detector.anonymize("Invoice from Acme-Corp, cc Quentin Farsworth");
+        assert!(!anonymized.text.contains("Acme"), "{anonymized:?}");
+        assert!(!anonymized.text.contains("Farsworth"), "{anonymized:?}");
+        assert_eq!(
+            restore(&anonymized.text, &anonymized.mappings),
+            "Invoice from Acme-Corp, cc Quentin Farsworth"
+        );
+
+        // Whole-word only: a configured value must not fire inside a longer word.
+        assert!(
+            detector
+                .scan("the pacman game and an acronym")
+                .iter()
+                .all(|detection| detection.kind != Kind::Custom),
+        );
+        // Unconfigured text is untouched, and so is a one-character value.
+        assert!(
+            Detector::default()
+                .with_redactions(&["x".to_owned()])
+                .scan("x marks the spot")
+                .is_empty(),
+        );
     }
 
     #[test]

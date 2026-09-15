@@ -68,7 +68,12 @@ struct ScanRequest {
 async fn scan(State(state): State<ProxyState>, request: Request<Body>) -> Response<Body> {
     let body = match to_bytes(request.into_body(), state.max_body_bytes).await {
         Ok(body) => body,
-        Err(_) => return json_error(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"),
+        Err(_) => {
+            return json_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Gatekeeper refused the request: body exceeds its size limit",
+            );
+        }
     };
     let input: ScanRequest = match serde_json::from_slice(&body) {
         Ok(input) => input,
@@ -103,7 +108,12 @@ async fn proxy(State(state): State<ProxyState>, request: Request<Body>) -> Respo
     let (parts, body) = request.into_parts();
     let body = match to_bytes(body, state.max_body_bytes).await {
         Ok(body) => body,
-        Err(_) => return json_error(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"),
+        Err(_) => {
+            return json_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Gatekeeper refused the request: body exceeds its size limit",
+            );
+        }
     };
 
     // Mappings belong to this request alone: a placeholder only resolves in the
@@ -120,9 +130,12 @@ async fn proxy(State(state): State<ProxyState>, request: Request<Body>) -> Respo
             // file contents ride this very request onward. Writes pass untouched.
             if let Some(name) = toolguard::protected_file_read(&value) {
                 tracing::warn!(file = name, "blocked tool call reading a protected file");
-                return json_error(
+                return security_error(
                     StatusCode::FORBIDDEN,
-                    format!("read access to {name} is not allowed"),
+                    format!(
+                        "Gatekeeper blocked this request over security concerns: reading {name} \
+                         would send its contents to the model provider"
+                    ),
                 );
             }
             let mut mappings = HashMap::new();
@@ -211,7 +224,12 @@ async fn upstream_response(
         let bytes = match collect_limited(upstream.bytes_stream(), state.max_body_bytes).await {
             Ok(bytes) => bytes,
             Err(LimitedBodyError::TooLarge) => {
-                return json_error(StatusCode::PAYLOAD_TOO_LARGE, "upstream body too large");
+                return security_error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "Gatekeeper refused an oversized upstream response: redaction placeholders \
+                     cannot be restored inside it, so forwarding would hand back tokens instead \
+                     of your own values",
+                );
             }
             Err(LimitedBodyError::Upstream(error)) => {
                 tracing::warn!(%error, "failed reading upstream response");
@@ -622,8 +640,30 @@ fn filtered_header(name: &HeaderName, connection_headers: &HashSet<HeaderName>) 
         || connection_headers.contains(name)
 }
 
+/// Gatekeeper's own error body, shaped like a provider error — `error.type` plus
+/// `error.message`. SDKs and models render that shape and skip a bare
+/// `{"error": "..."}`, which is why a denial used to surface as an opaque
+/// transport failure instead of a reason.
 fn json_error(status: StatusCode, message: impl Into<String>) -> Response<Body> {
-    (status, Json(json!({ "error": message.into() }))).into_response()
+    error_response(status, "gateway_error", message)
+}
+
+/// A refusal caused by Gatekeeper policy rather than by the upstream. The
+/// `error.type` is what a caller branches on; the message says who refused and
+/// why, since the model relaying this to a human has nothing else to go on.
+fn security_error(status: StatusCode, message: impl Into<String>) -> Response<Body> {
+    error_response(status, "gatekeeper_security_error", message)
+}
+
+fn error_response(status: StatusCode, kind: &str, message: impl Into<String>) -> Response<Body> {
+    (
+        status,
+        Json(json!({
+            "type": "error",
+            "error": { "type": kind, "message": message.into() },
+        })),
+    )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -1131,9 +1171,12 @@ mod tests {
         let response = router.oneshot(request).await.expect("response");
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
-        // The deny is generic: neither the path nor the request body echoes back.
+        // The deny is generic: neither the path nor the request body echoes back,
+        // and it says who refused so a client cannot mistake it for the provider.
         let seen = body_text(response).await;
-        assert!(seen.contains("not allowed"), "{seen}");
+        assert!(seen.contains("Gatekeeper"), "{seen}");
+        assert!(seen.contains("security"), "{seen}");
+        assert!(seen.contains("gatekeeper_security_error"), "{seen}");
         assert!(!seen.contains("/app/"), "{seen}");
         assert!(!seen.contains("tool_use"), "{seen}");
     }

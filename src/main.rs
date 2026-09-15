@@ -12,7 +12,7 @@ async fn main() -> anyhow::Result<()> {
     init_tracing();
 
     let config = Config::from_env().context("invalid Gatekeeper configuration")?;
-    let detector = Arc::new(Detector::default());
+    let detector = Arc::new(Detector::default().with_redactions(&config.redactions));
     let state = ProxyState::new(
         config.target_url,
         reqwest::Client::new(),
