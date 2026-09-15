@@ -5,11 +5,7 @@ COPY src ./src
 COPY benches ./benches
 RUN cargo build --release --locked
 
-FROM debian:bookworm-slim
-RUN apt-get update \
-    && apt-get install --yes --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+FROM gcr.io/distroless/cc-debian13:nonroot
 COPY --from=builder /app/target/release/gatekeeper /usr/local/bin/gatekeeper
 EXPOSE 8080
-USER 65532:65532
-ENTRYPOINT ["gatekeeper"]
+ENTRYPOINT ["/usr/local/bin/gatekeeper"]
