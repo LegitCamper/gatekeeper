@@ -109,40 +109,49 @@ async fn proxy(State(state): State<ProxyState>, request: Request<Body>) -> Respo
     // Mappings belong to this request alone: a placeholder only resolves in the
     // response to the request that created it, so one client's values can never
     // be spliced into another's response, and model-invented text is untouched.
-    let (outgoing_body, mappings) = if content_type.as_deref().is_some_and(is_json) {
-        let mut value: Value = match serde_json::from_slice(&body) {
-            Ok(value) => value,
-            Err(error) => {
+    //
+    // Dispatch on the body's *shape*, not its declared content-type. Providers
+    // parse a JSON body whatever the header claims, so a client that sends JSON
+    // as `text/plain` — or with no content-type at all — would otherwise hand
+    // the upstream unredacted PII.
+    let (outgoing_body, mappings) = match serde_json::from_slice::<Value>(&body) {
+        Ok(mut value) => {
+            // Reads of `.env` and key material must never reach the provider: the
+            // file contents ride this very request onward. Writes pass untouched.
+            if let Some(name) = toolguard::protected_file_read(&value) {
+                tracing::warn!(file = name, "blocked tool call reading a protected file");
                 return json_error(
-                    StatusCode::BAD_REQUEST,
-                    format!("invalid JSON request body: {error}"),
+                    StatusCode::FORBIDDEN,
+                    format!("read access to {name} is not allowed"),
                 );
             }
-        };
-        // Reads of `.env` and key material must never reach the provider: the
-        // file contents ride this very request onward. Writes pass untouched.
-        if let Some(name) = toolguard::protected_file_read(&value) {
-            tracing::warn!(file = name, "blocked tool call reading a protected file");
+            let mut mappings = HashMap::new();
+            anonymize_json(&mut value, &state.detector, &mut mappings);
+            tracing::debug!(count = mappings.len(), "anonymized request");
+            match serde_json::to_vec(&value) {
+                Ok(encoded) => (Bytes::from(encoded), mappings),
+                Err(error) => {
+                    return json_error(
+                        StatusCode::BAD_GATEWAY,
+                        format!("failed to encode anonymized request: {error}"),
+                    );
+                }
+            }
+        }
+        // A body that claims to be JSON but is not stays a client error.
+        Err(error) if content_type.as_deref().is_some_and(is_json) => {
             return json_error(
-                StatusCode::FORBIDDEN,
-                format!("read access to {name} is not allowed"),
+                StatusCode::BAD_REQUEST,
+                format!("invalid JSON request body: {error}"),
             );
         }
-        let mut mappings = HashMap::new();
-        anonymize_json(&mut value, &state.detector, &mut mappings);
-        tracing::debug!(count = mappings.len(), "anonymized request");
-        match serde_json::to_vec(&value) {
-            Ok(encoded) => (Bytes::from(encoded), mappings),
-            Err(error) => {
-                return json_error(
-                    StatusCode::BAD_GATEWAY,
-                    format!("failed to encode anonymized request: {error}"),
-                );
-            }
+        // `ponytail:` a body that is not JSON at all (binary upload, form post,
+        // bare prose) passes through unredacted. Upgrade path: anonymize bodies
+        // that are valid UTF-8 text as well, keeping only true binary opaque.
+        Err(_) => {
+            tracing::debug!("request body is not JSON, skipping anonymization");
+            (body, HashMap::new())
         }
-    } else {
-        tracing::debug!("request not JSON, skipping anonymization");
-        (body, HashMap::new())
     };
 
     let mut upstream = state.client.request(method, target);
@@ -839,6 +848,43 @@ mod tests {
         }
 
         assert_eq!(content, "USADONESTATUS_OK");
+    }
+
+    /// A digest a model split with formatting can also land across a chunk
+    /// boundary. Both mangling forms have to compose, or streaming responses put a
+    /// live hash in the client's view.
+    #[test]
+    fn restores_noise_split_hash_across_every_chunk_boundary() {
+        let mappings = HashMap::from([(
+            "[EMAIL_0123456789ab]".to_owned(),
+            "alice@example.com".to_owned(),
+        )]);
+        let restorer = Restorer::new(&mappings);
+
+        for variant in [
+            "012345**6789ab**",
+            "012345 6789ab",
+            "0 1 2 3 4 5 6 7 8 9 a b",
+            "012345\n6789ab",
+        ] {
+            for split in 1..variant.len() {
+                if !variant.is_char_boundary(split) {
+                    continue;
+                }
+                let mut carry = RestoreCarry::default();
+                let mut output = restore_stream_text(&variant[..split], &mut carry, &restorer);
+                output.push_str(&restore_stream_text(
+                    &variant[split..],
+                    &mut carry,
+                    &restorer,
+                ));
+                output.push_str(&carry.text);
+                assert!(
+                    output.contains("alice@example.com"),
+                    "live hash reached the client for {variant:?} split at {split}: {output:?}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -191,7 +191,11 @@ impl Default for Detector {
             ),
             (
                 Kind::CreditCard,
-                Regex::new(r"\d(?:[ -]?\d){11,18}").expect("card pattern is valid"),
+                // Deliberately allowed to run past a card's own digits: a
+                // greedy span that swallows the next number is tightened back
+                // to the real card by [`tighten_numeric_span`]. Capped so a
+                // pathological digit run cannot blow up that search.
+                Regex::new(r"\d(?:[ -]?\d){11,40}").expect("card pattern is valid"),
             ),
             (
                 Kind::Ssn,
@@ -449,17 +453,33 @@ impl Restorer {
                 continue;
             }
 
-            if cursor + DIGEST_LEN <= full_text.len()
+            // A digest only counts when the hex run is exactly DIGEST_LEN long:
+            // the same 12 hex characters inside a commit sha or checksum belong
+            // to that value, and splicing PII into it corrupts the response.
+            let hex_run_bounded = cursor + DIGEST_LEN <= full_text.len()
                 && bytes[cursor..cursor + DIGEST_LEN]
                     .iter()
                     .all(u8::is_ascii_hexdigit)
-            {
-                let digest = full_text[cursor..cursor + DIGEST_LEN].to_ascii_lowercase();
+                && !bytes
+                    .get(cursor + DIGEST_LEN)
+                    .is_some_and(u8::is_ascii_alphanumeric);
+            let found = if hex_run_bounded {
+                Some((
+                    full_text[cursor..cursor + DIGEST_LEN].to_ascii_lowercase(),
+                    cursor + DIGEST_LEN,
+                ))
+            } else {
+                split_digest(&full_text, cursor)
+            };
+            // Either way the run has to start on a boundary, so a digest sitting
+            // inside a longer hex value stays part of that value.
+            let on_boundary = !(cursor > 0 && bytes[cursor - 1].is_ascii_alphanumeric());
+            if on_boundary && let Some((digest, digest_end)) = found {
                 if let Some(Some(original)) = self.digests.get(&digest) {
                     let decorated = decoration_start(&full_text, cursor);
                     let bracketed = cursor > 0
                         && bytes[cursor - 1] == b'['
-                        && bytes.get(cursor + DIGEST_LEN) == Some(&b']');
+                        && bytes.get(digest_end) == Some(&b']');
                     let start = decorated.or_else(|| bracketed.then(|| cursor - 1));
                     if let Some(start) = start {
                         let decoration = &full_text[start..cursor];
@@ -468,7 +488,7 @@ impl Restorer {
                         }
                     }
                     output.push_str(original);
-                    cursor += DIGEST_LEN;
+                    cursor = digest_end;
                     if start.is_some() {
                         if bytes.get(cursor) == Some(&b']') {
                             cursor += 1;
@@ -496,6 +516,71 @@ impl Restorer {
         }
         output
     }
+}
+
+/// Characters a model inserts *into* a digest while formatting it — markdown
+/// emphasis, a line wrap, spacing between characters. Not `-` or `_`: those carry
+/// meaning inside real identifiers (`abc-123`, commit ranges), and treating them
+/// as noise would let unrelated text collapse into a digest.
+const DIGEST_NOISE: &[u8] = b"* \t\n\r`";
+
+/// Read a digest whose hex characters a model broke up with formatting, e.g.
+/// `894e**a3db5**2e8`, `894ea3d\nb52e8`, or `8 9 4 e a 3 d b 5 2 e 8`.
+///
+/// Small models reformat tokens freely, and an unrecovered digest reaches the
+/// client as a live hash — deleting the inserted characters recovers the value it
+/// stood for. Returns the digest plus the byte offset just past it.
+///
+/// Requires the run to *start* with a hex digit and to hold exactly
+/// [`DIGEST_LEN`] of them, and stops at the first noise run longer than three
+/// bytes, so ordinary prose containing scattered hex letters cannot be stitched
+/// into a token.
+fn split_digest(text: &str, start: usize) -> Option<(String, usize)> {
+    let bytes = text.as_bytes();
+    if !bytes.get(start).is_some_and(u8::is_ascii_hexdigit) {
+        return None;
+    }
+
+    let mut digest = String::with_capacity(DIGEST_LEN);
+    let mut cursor = start;
+    let mut end = start;
+    while cursor < bytes.len() && digest.len() < DIGEST_LEN {
+        if bytes[cursor].is_ascii_hexdigit() {
+            digest.push(bytes[cursor].to_ascii_lowercase() as char);
+            cursor += 1;
+            end = cursor;
+            continue;
+        }
+        let noise = bytes[cursor..]
+            .iter()
+            .take_while(|byte| DIGEST_NOISE.contains(byte))
+            .count();
+        if noise == 0 || noise > 3 {
+            break;
+        }
+        cursor += noise;
+    }
+
+    if digest.len() != DIGEST_LEN || bytes.get(end).is_some_and(u8::is_ascii_alphanumeric) {
+        return None;
+    }
+
+    // The run must also *end* where the hex does, looking past trailing noise:
+    // `0 1 2 3 4 5 6 7 8 9 a b c d` holds a digest's worth of characters in its
+    // first twelve, and without this it would restore and leave `c d` behind.
+    let trailing_noise = bytes[end..]
+        .iter()
+        .take_while(|byte| DIGEST_NOISE.contains(byte))
+        .count();
+    if (1..=3).contains(&trailing_noise)
+        && bytes
+            .get(end + trailing_noise)
+            .is_some_and(u8::is_ascii_hexdigit)
+    {
+        return None;
+    }
+
+    Some((digest, end))
 }
 
 fn decoration_start(text: &str, digest_start: usize) -> Option<usize> {
@@ -545,10 +630,40 @@ fn partial_suffix_len(text: &str, tokens: &HashMap<String, String>, digests: &[S
                 return true;
             }
             digests.iter().any(|digest| digest.starts_with(suffix))
+                // A digest a model split with formatting can also straddle a
+                // chunk boundary (`012345**67` then `89ab**`). Without this the
+                // carry ends at the `*` and the two halves are emitted verbatim,
+                // putting a live hash in the client's view — streaming is the
+                // normal path, so the noise-tolerant match has to apply here too.
+                || noise_stripped_digest_prefix(suffix, digests)
                 || ((*start == 0 || !text.as_bytes()[start - 1].is_ascii_alphanumeric())
                     && token_decoration_prefix(suffix, digests))
         })
         .map_or(0, |start| text.len() - start)
+}
+
+/// Is `text`, once formatting characters are dropped, the start of a known digest?
+///
+/// Lets [`partial_suffix_len`] hold back a digest that a model both split with
+/// formatting and left straddling a chunk boundary. Requires at least one hex
+/// character so a lone `*` or space is never carried.
+fn noise_stripped_digest_prefix(text: &str, digests: &[String]) -> bool {
+    if text.len() > DIGEST_LEN * 4 {
+        return false;
+    }
+    let mut hex = String::with_capacity(DIGEST_LEN);
+    for byte in text.bytes() {
+        if byte.is_ascii_hexdigit() {
+            hex.push(byte.to_ascii_lowercase() as char);
+        } else if !DIGEST_NOISE.contains(&byte) {
+            return false;
+        }
+        if hex.len() > DIGEST_LEN {
+            return false;
+        }
+    }
+
+    !hex.is_empty() && digests.iter().any(|digest| digest.starts_with(&hex))
 }
 
 fn token_decoration_prefix(text: &str, digests: &[String]) -> bool {
@@ -576,11 +691,105 @@ pub fn restore(text: &str, mappings: &HashMap<String, String>) -> String {
     Restorer::new(mappings).restore(text)
 }
 
+/// Does `at` fall on a `.` boundary inside a dotted number such as `203.0.113.55`?
+///
+/// Used to reject tightened spans that would keep only part of a neighbouring IP
+/// or version string.
+fn splits_dotted_number(text: &str, at: usize) -> bool {
+    let bytes = text.as_bytes();
+    let dot_before = at >= 2 && bytes[at - 1] == b'.' && bytes[at - 2].is_ascii_digit();
+    let dot_after = bytes.get(at) == Some(&b'.')
+        && bytes.get(at + 1).is_some_and(u8::is_ascii_digit)
+        && at > 0
+        && bytes[at - 1].is_ascii_digit();
+    dot_before || dot_after
+}
+
+/// Take the matched span when `accept` recognizes it and it does not straddle a
+/// neighbouring dotted number, otherwise tighten it.
+///
+/// The straddle check has to happen *before* the whole-span accept: `is_phone`
+/// returns true for `+1 (415) 555-2671 203` (14 digits, `+`-prefixed, parses as
+/// dialable), so accepting the greedy span produced a Phone that overlapped the
+/// IP — and [`Kind::Ip`] outranks [`Kind::Phone`], so the phone was discarded
+/// and reached the upstream in plaintext.
+fn accept_or_tighten(
+    text: &str,
+    start: usize,
+    end: usize,
+    accept: impl Fn(&str) -> bool,
+) -> Option<(usize, usize)> {
+    if !splits_dotted_number(text, start)
+        && !splits_dotted_number(text, end)
+        && accept(&text[start..end])
+    {
+        return Some((start, end));
+    }
+    tighten_numeric_span(text, start, end, accept)
+}
+
+/// Trim a numeric span until `accept` recognizes it, so a greedy match that ran
+/// into a neighbouring number still yields the value it started on.
+///
+/// `\d(?:[ -]?\d){11,40}` cannot tell a card's internal space from the space
+/// before the next number, so `4111-1111-1111-1111 203.0.113.55` matches as one
+/// 19-digit span that fails Luhn. Dropping the candidate there left the card in
+/// plaintext; instead, retry shorter prefixes (then suffixes, for a leading
+/// `ref 99 4111-...`) and report the first span that validates.
+fn tighten_numeric_span(
+    text: &str,
+    start: usize,
+    end: usize,
+    accept: impl Fn(&str) -> bool,
+) -> Option<(usize, usize)> {
+    // Split the span into digit groups. Only whole groups are dropped: trimming
+    // mid-run would let an arbitrary 16-digit order number yield whichever
+    // 13-digit substring happens to satisfy Luhn.
+    let groups: Vec<(usize, usize)> = text[start..end]
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|group| !group.is_empty())
+        .map(|group| {
+            let offset = start + (group.as_ptr() as usize - text[start..end].as_ptr() as usize);
+            (offset, offset + group.len())
+        })
+        .collect();
+
+    // Longest first, preferring spans that keep the original start, so the
+    // value the match began on wins over a shorter tail inside it.
+    for count in (1..=groups.len()).rev() {
+        for window in groups.windows(count) {
+            let (digits_from, stop) = (window[0].0, window[count - 1].1);
+            // Reclaim any `+` or `(` the first digit group left behind, so a
+            // parenthesized or country-prefixed number keeps the shape its
+            // validator recognizes.
+            let mut from = digits_from;
+            while from > start && matches!(text.as_bytes()[from - 1], b'+' | b'(') {
+                from -= 1;
+            }
+            // A span that stops mid-way through a dotted number has eaten part
+            // of an IP or version string. `is_phone` happily accepts
+            // `+1 (415) 555-2671 203`, and that span overlaps the IP, so the
+            // higher-priority IP wins the overlap and the phone is dropped
+            // entirely. Anchor to a boundary the neighbour does not straddle.
+            if splits_dotted_number(text, stop) || splits_dotted_number(text, digits_from) {
+                continue;
+            }
+            for candidate in [from, digits_from] {
+                if (candidate, stop) != (start, end) && accept(&text[candidate..stop]) {
+                    return Some((candidate, stop));
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Reject candidates that only look like the category, and tighten spans.
 fn validate(kind: Kind, text: &str, start: usize, end: usize) -> Option<(usize, usize)> {
     let value = &text[start..end];
     match kind {
-        Kind::CreditCard => is_payment_card(value).then_some((start, end)),
+        Kind::CreditCard => accept_or_tighten(text, start, end, is_payment_card),
         // Loopback and `0.0.0.0` identify nobody; tokenizing them breaks config
         // and bind-address round-trips.
         Kind::Ip => value
@@ -590,7 +799,12 @@ fn validate(kind: Kind, text: &str, start: usize, end: usize) -> Option<(usize, 
             .map(|_| (start, end)),
         Kind::Phone => {
             let preceded_by_word = start > 0 && is_word_byte(text.as_bytes()[start - 1]);
-            (!preceded_by_word && is_phone(value)).then_some((start, end))
+            if preceded_by_word {
+                return None;
+            }
+            // Same greedy-span problem as cards: `415-555-2671 203.0.113.55`
+            // matches as one run, so retry shorter spans before giving up.
+            accept_or_tighten(text, start, end, is_phone)
         }
         // Reject when any word of the pair is a calendar or direction word.
         Kind::Name => value
