@@ -84,6 +84,16 @@ pub struct Anonymized {
 }
 
 const DIGEST_LEN: usize = 12;
+/// Shortest bare hex tail worth holding back as a possible split digest.
+///
+/// A one- or two-character hex tail is far more often the real end of a
+/// provider string (`claude-haiku-4-5`, `gpt-4`, `index: 3`) than the start of
+/// a digest the model stripped to bare hex. Holding one back withholds a
+/// character the field may never get a chance to reclaim — the field path never
+/// recurs — so the value is silently truncated, and on a `type` field that ends
+/// the stream for the client. A split *token* still carries at any length: the
+/// `[LABEL_` branch below is specific enough to be safe.
+const MIN_DIGEST_CARRY: usize = 4;
 const MAX_TOKEN_CARRY: usize = 64;
 const TOKEN_DECORATION_LABELS: &[&str] = &[
     "API_KEY",
@@ -873,18 +883,25 @@ fn partial_suffix_len(text: &str, tokens: &HashMap<String, String>, digests: &[S
             if suffix.is_empty() {
                 return false;
             }
+            // Speculation must obey the matcher's boundary rule. Otherwise the
+            // final `a` in `content_block_delta` can be withheld as a possible
+            // digest prefix, and a later event receives that stray character.
+            let bounded = *start == 0 || !text.as_bytes()[start - 1].is_ascii_alphanumeric();
             if tokens.keys().any(|token| token.starts_with(suffix)) {
                 return true;
             }
-            digests.iter().any(|digest| digest.starts_with(suffix))
-                // A digest a model split with formatting can also straddle a
-                // chunk boundary (`012345**67` then `89ab**`). Without this the
-                // carry ends at the `*` and the two halves are emitted verbatim,
-                // putting a live hash in the client's view — streaming is the
-                // normal path, so the noise-tolerant match has to apply here too.
-                || noise_stripped_digest_prefix(suffix, digests)
-                || ((*start == 0 || !text.as_bytes()[start - 1].is_ascii_alphanumeric())
-                    && token_decoration_prefix(suffix, digests))
+            // A bare hex tail must be long enough to be worth the truncation
+            // risk; decorated forms still carry, since `[`/`*` mark intent.
+            bounded
+                && (((suffix.len() >= MIN_DIGEST_CARRY || suffix.len() == text.len())
+                    && (digests.iter().any(|digest| digest.starts_with(suffix))
+                        // A digest a model split with formatting can also straddle a
+                        // chunk boundary (`012345**67` then `89ab**`). Without this the
+                        // carry ends at the `*` and the two halves are emitted verbatim,
+                        // putting a live hash in the client's view — streaming is the
+                        // normal path, so the noise-tolerant match has to apply here too.
+                        || noise_stripped_digest_prefix(suffix, digests)))
+                    || token_decoration_prefix(suffix, digests))
         })
         .map_or(0, |start| text.len() - start)
 }

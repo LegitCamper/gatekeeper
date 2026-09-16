@@ -397,8 +397,9 @@ fn restore_json(value: &mut Value, restorer: &Restorer) {
 
 /// Restore tokens in object keys. Rebuild only changed entries; common path has
 /// no map mutation. Collisions stay tokenized because JSON cannot losslessly hold
-/// two values under the same restored key.
-fn restore_object_keys(values: &mut serde_json::Map<String, Value>, restorer: &Restorer) {
+/// two values under the same restored key. Returns whether a rename landed.
+fn restore_object_keys(values: &mut serde_json::Map<String, Value>, restorer: &Restorer) -> bool {
+    let mut changed = false;
     let renames: Vec<(String, String)> = values
         .keys()
         .filter_map(|key| {
@@ -412,8 +413,10 @@ fn restore_object_keys(values: &mut serde_json::Map<String, Value>, restorer: &R
         }
         if let Some(value) = values.remove(&key) {
             values.insert(restored, value);
+            changed = true;
         }
     }
+    changed
 }
 
 /// Partial placeholders held between events.
@@ -475,17 +478,26 @@ fn restored_lines(
 }
 
 fn restore_stream_line(line: &str, pending: &mut StreamCarry, restorer: &Restorer) -> String {
-    let (content, newline) = line
-        .strip_suffix('\n')
-        .map_or((line, ""), |content| (content, "\n"));
+    let (content, line_end) = if let Some(content) = line.strip_suffix("\r\n") {
+        (content, "\r\n")
+    } else if let Some(content) = line.strip_suffix('\n') {
+        (content, "\n")
+    } else {
+        (line, "")
+    };
     let mut restored = String::with_capacity(line.len());
 
     if let Some(payload) = content.strip_prefix("data:") {
         let separator_len = payload.starts_with(' ') as usize;
         let (separator, payload) = payload.split_at(separator_len);
+        // serde accepts a trailing CR as JSON whitespace but omits it when
+        // reserializing. Hold it outside the payload so CRLF SSE stays CRLF.
+        let carriage_return_len = payload.ends_with('\r') as usize;
+        let (payload, carriage_return) = payload.split_at(payload.len() - carriage_return_len);
         restored.push_str("data:");
         restored.push_str(separator);
         restored.push_str(&restore_stream_payload(payload, pending, restorer));
+        restored.push_str(carriage_return);
     } else if let Some(payload) = restore_stream_json(content, pending, restorer) {
         // A bare JSON line, as NDJSON streams send.
         restored.push_str(&payload);
@@ -495,7 +507,7 @@ fn restore_stream_line(line: &str, pending: &mut StreamCarry, restorer: &Restore
         // as a possible digest prefix and corrupt names such as `message_delta`.
         restored.push_str(content);
     }
-    restored.push_str(newline);
+    restored.push_str(line_end);
     restored
 }
 
@@ -532,23 +544,45 @@ fn restore_stream_json(
         return None;
     }
 
-    restore_json_fields(&mut value, &mut String::new(), pending, restorer);
+    // Parsing and reserializing normalizes whitespace, number formatting, and
+    // provider key order. Leave untouched event payloads exactly as upstream sent
+    // them; replacement values must be JSON-escaped, so serde can only produce a
+    // valid payload, never the original bytes.
+    let mut changed = false;
+    restore_json_fields(
+        &mut value,
+        &mut String::new(),
+        pending,
+        restorer,
+        &mut changed,
+    );
+    if !changed {
+        return Some(payload.to_owned());
+    }
     serde_json::to_string(&value).ok()
 }
 
 /// Restore every string in an event body, keeping a separate partial
 /// placeholder per field path so fragments rejoin the field they came from.
+#[allow(clippy::too_many_arguments)]
 fn restore_json_fields(
     value: &mut Value,
     path: &mut String,
     pending: &mut StreamCarry,
     restorer: &Restorer,
+    changed: &mut bool,
 ) {
     match value {
         Value::String(text) => {
             let mut carry = pending.fields.remove(path.as_str()).unwrap_or_default();
-            *text = restore_stream_text(text, &mut carry, restorer);
             if !carry.text.is_empty() || carry.skip_closing_bracket {
+                *changed = true;
+            }
+            let restored = restore_stream_text(text, &mut carry, restorer);
+            *changed |= restored != *text;
+            *text = restored;
+            if !carry.text.is_empty() || carry.skip_closing_bracket {
+                *changed = true;
                 pending.fields.insert(path.clone(), carry);
             }
         }
@@ -557,21 +591,32 @@ fn restore_json_fields(
                 let parent = path.len();
                 path.push('.');
                 path.push_str(&index.to_string());
-                restore_json_fields(value, path, pending, restorer);
+                restore_json_fields(value, path, pending, restorer, changed);
                 path.truncate(parent);
             }
         }
         Value::Object(values) => {
-            // Restore values under their original field paths first, then rename
-            // keys. Carry state is keyed by that original path across events.
+            // Anthropic can interleave events from parallel content blocks while
+            // reusing the same field path (`.delta.text`). Include the block's
+            // sibling index so a fragment is never stitched into another block.
+            let parent = path.len();
+            for key in ["index", "output_index", "content_index"] {
+                if let Some(Value::Number(index)) = values.get(key) {
+                    path.push('[');
+                    path.push_str(&index.to_string());
+                    path.push(']');
+                    break;
+                }
+            }
             for (key, value) in values.iter_mut() {
-                let parent = path.len();
+                let path_before_key = path.len();
                 path.push('.');
                 path.push_str(key);
-                restore_json_fields(value, path, pending, restorer);
-                path.truncate(parent);
+                restore_json_fields(value, path, pending, restorer, changed);
+                path.truncate(path_before_key);
             }
-            restore_object_keys(values, restorer);
+            *changed |= restore_object_keys(values, restorer);
+            path.truncate(parent);
         }
         Value::Null | Value::Bool(_) | Value::Number(_) => {}
     }
@@ -961,12 +1006,15 @@ mod tests {
 
         // Streaming JSON events use a separate recursive walker.
         let mut streamed = json!({"delta": {"[EMAIL_0123456789ab]": "value"}});
+        let mut changed = false;
         restore_json_fields(
             &mut streamed,
             &mut String::new(),
             &mut StreamCarry::default(),
             &restorer,
+            &mut changed,
         );
+        assert!(changed);
         assert_eq!(streamed, json!({"delta": {"alice@example.com": "value"}}));
     }
 
@@ -1474,6 +1522,239 @@ mod tests {
         }
 
         assert_eq!(content, "alice@example.com");
+    }
+
+    async fn restored_lines_text(
+        event: impl Into<String>,
+        mappings: &HashMap<String, String>,
+    ) -> String {
+        let stream = restored_lines(
+            futures_util::stream::iter([Ok(Bytes::from(event.into()))]),
+            Restorer::new(mappings),
+        );
+        futures_util::pin_mut!(stream);
+
+        let mut output = String::new();
+        while let Some(chunk) = stream.next().await {
+            output.push_str(std::str::from_utf8(&chunk.expect("chunk")).expect("utf-8"));
+        }
+        output
+    }
+
+    /// An event that has no placeholder must not be reordered or reserialized by
+    /// merely recognizing its JSON envelope.
+    #[tokio::test]
+    async fn untouched_sse_json_payload_bytes_are_preserved() {
+        let payload = r#"{"z":1.0,"type":"message_start","a":[true,null]}"#;
+        let output = restored_lines_text(
+            format!("data: {payload}\n\n"),
+            &HashMap::from([(
+                "[EMAIL_0123456789ab]".to_owned(),
+                "alice@example.com".to_owned(),
+            )]),
+        )
+        .await;
+
+        assert_eq!(output, format!("data: {payload}\n\n"));
+    }
+
+    #[tokio::test]
+    async fn crlf_sse_framing_survives_restoration() {
+        let event = concat!(
+            "event: message_delta\r\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"text\":\"mail [EMAIL_0123\"}}\r\n",
+            "\r\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"text\":\"456789ab]\"}}\r\n",
+            "\r\n"
+        );
+
+        let output = restored_lines_text(
+            event,
+            &HashMap::from([(
+                "[EMAIL_0123456789ab]".to_owned(),
+                "alice@example.com".to_owned(),
+            )]),
+        )
+        .await;
+
+        // A restored payload is re-encoded, so key order is serde_json's; what
+        // must survive is the CRLF framing and the untouched `event:` line.
+        assert!(output.ends_with("\r\n\r\n"), "got {output:?}");
+        let lines = output.split('\n').collect::<Vec<_>>();
+        assert_eq!(lines.last(), Some(&""), "every line ends CRLF");
+        assert!(
+            lines[..lines.len() - 1]
+                .iter()
+                .all(|line| line.ends_with('\r')),
+            "CRLF framing was rewritten: {lines:?}"
+        );
+        assert_eq!(lines[0], "event: message_delta\r");
+        let texts = lines
+            .iter()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|line| {
+                serde_json::from_str::<Value>(line.trim_end_matches('\r'))
+                    .expect("CRLF payload remains valid JSON")
+            })
+            .map(|payload| payload["delta"]["text"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(texts, ["mail ", "alice@example.com"]);
+    }
+
+    /// Parallel Anthropic blocks reuse `.delta.text`; carry must follow block
+    /// identity, not merely the structural field path.
+    #[tokio::test]
+    async fn parallel_sse_content_blocks_do_not_share_carry() {
+        let event = concat!(
+            "data: {\"type\":\"content_block_delta\",\"index\":0,",
+            "\"delta\":{\"type\":\"text_delta\",\"text\":\"[EMAIL_0123\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,",
+            "\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,",
+            "\"delta\":{\"type\":\"text_delta\",\"text\":\"456789ab]\"}}\n\n"
+        );
+
+        let output = restored_lines_text(
+            event,
+            &HashMap::from([(
+                "[EMAIL_0123456789ab]".to_owned(),
+                "alice@example.com".to_owned(),
+            )]),
+        )
+        .await;
+        let payloads = output
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|line| serde_json::from_str::<Value>(line).expect("valid JSON"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(payloads.len(), 3);
+        assert_eq!(payloads[0]["delta"]["text"], "");
+        assert_eq!(payloads[1]["delta"]["text"], "hello");
+        assert_eq!(payloads[2]["delta"]["text"], "alice@example.com");
+    }
+
+    /// Reproduces the live Anthropic failure deterministically: a request-local
+    /// digest beginning `a` used to make the matcher hold the final character of
+    /// `content_block_delta`, then contaminate every later payload sharing `.type`.
+    #[tokio::test]
+    async fn anthropic_event_types_survive_hex_digest_carry() {
+        let event = concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,",
+            "\"delta\":{\"type\":\"text_delta\",\"text\":\"mail [EMAIL_0123\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,",
+            "\"delta\":{\"type\":\"text_delta\",\"text\":\"456789ab]\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+
+        let output = restored_lines_text(
+            event,
+            &HashMap::from([(
+                "[EMAIL_0123456789ab]".to_owned(),
+                "alice@example.com".to_owned(),
+            )]),
+        )
+        .await;
+
+        assert_eq!(
+            output
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .map(|line| {
+                    serde_json::from_str::<Value>(line)
+                        .expect("Anthropic data payload remains valid JSON")
+                })
+                .map(|payload| payload["type"].as_str().expect("payload type").to_owned())
+                .collect::<Vec<_>>(),
+            [
+                "content_block_delta",
+                "content_block_delta",
+                "message_delta",
+                "message_stop"
+            ]
+        );
+        // Only the `event:` line and untouched payloads keep upstream bytes; a
+        // restored payload is re-encoded, so its key order is serde_json's.
+        assert!(
+            output.contains("event: content_block_delta\n"),
+            "Anthropic event name was rewritten: {output}"
+        );
+        assert!(
+            output.contains("\"type\":\"content_block_delta\""),
+            "Anthropic event type was rewritten: {output}"
+        );
+        assert!(
+            output.contains("alice@example.com"),
+            "token was not restored: {output}"
+        );
+        assert!(
+            !output.contains("amessage_delta"),
+            "carry leaked into a later event: {output}"
+        );
+    }
+
+    /// A fragment at an alphanumeric boundary can only restore if the completed
+    /// matcher could accept it. Speculation must be no looser than restoration.
+    #[test]
+    fn hex_run_inside_an_identifier_is_not_carried() {
+        let mappings = HashMap::from([(
+            "[EMAIL_0123456789ab]".to_owned(),
+            "alice@example.com".to_owned(),
+        )]);
+        let restorer = Restorer::new(&mappings);
+        let mut carry = RestoreCarry::default();
+
+        assert_eq!(
+            restore_stream_text("sha012345", &mut carry, &restorer),
+            "sha012345"
+        );
+        assert!(carry.text.is_empty());
+        assert_eq!(
+            restore_stream_text("6789ab more", &mut carry, &restorer),
+            "6789ab more"
+        );
+    }
+
+    /// Every leading hex nibble must leave provider protocol constants intact.
+    #[test]
+    fn every_hex_digest_prefix_preserves_protocol_constants() {
+        for nibble in "0123456789abcdef".chars() {
+            let token = format!("[EMAIL_{nibble}123456789ab]");
+            assert_eq!(token.len(), "[EMAIL_0123456789ab]".len(), "12-hex digest");
+            let mappings = HashMap::from([(token, "alice@example.com".to_owned())]);
+            let restorer = Restorer::new(&mappings);
+
+            for text in [
+                "content_block_delta",
+                "message_delta",
+                "text_delta",
+                "input_json_delta",
+                "thinking_delta",
+                "tool_use",
+                "end_turn",
+                "chat.completion.chunk",
+                "claude-haiku-4-5",
+            ] {
+                let mut carry = RestoreCarry::default();
+                assert_eq!(
+                    restore_stream_text(text, &mut carry, &restorer),
+                    text,
+                    "digest prefix {nibble:?} rewrote {text:?}"
+                );
+                // A holdback is the failure mode: the withheld tail is what
+                // contaminates the next event, even when this one looks intact.
+                assert!(
+                    carry.text.is_empty(),
+                    "digest prefix {nibble:?} held back the tail of {text:?}: {:?}",
+                    carry.text
+                );
+            }
+        }
     }
 
     #[tokio::test]

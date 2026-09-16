@@ -794,7 +794,47 @@ async fn canonical_anthropic_sse_stays_parseable() {
         7,
         "SSE event separators were not preserved: {body}"
     );
-    assert!(body.contains(&email()), "email was not restored: {body}");
+    let events = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("event: "))
+        .map(str::to_owned);
+    let payloads = body.lines().filter_map(|line| line.strip_prefix("data: "));
+    for (event, payload) in events.zip(payloads) {
+        let payload: serde_json::Value =
+            serde_json::from_str(payload).expect("valid Anthropic SSE JSON");
+        assert_eq!(
+            payload["type"], event,
+            "SSE event name and payload type disagree"
+        );
+    }
+    // Nested protocol fields are checked by pointer, not by byte prefix: a
+    // restored payload is re-encoded, so upstream's key order is not preserved.
+    assert!(
+        body.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+            .any(|payload| payload.pointer("/delta/text")
+                == Some(&serde_json::Value::String(email()))
+                && payload.pointer("/delta/type")
+                    == Some(&serde_json::Value::String("text_delta".to_owned()))
+                && payload["type"] == "content_block_delta"),
+        "Anthropic delta metadata was rewritten: {body}"
+    );
+    let restored_content = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+        .filter_map(|payload| {
+            payload
+                .pointer("/delta/text")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect::<String>();
+    assert!(
+        restored_content.contains(&email()),
+        "streamed email was not restored: {body}"
+    );
     assert!(body.ends_with("data: {\"type\":\"message_stop\"}\n\n"));
 }
 
