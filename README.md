@@ -40,6 +40,8 @@ Gatekeeper is a Rust/Axum reverse proxy that removes sensitive values before LLM
         digests are cached process-wide, so a token the client
           echoes from an earlier turn still restores once the
           trigger context that first exposed it is gone
+          (dropped 30 min after last use, or under 1 GiB /
+           10k-entry pressure; colliding digests serve nothing)
    6  headers - hop-by-hop dropped, client accept-encoding
       dropped, upstream asked for identity
    7  auth - UPSTREAM_API_KEY replaces the client credential;

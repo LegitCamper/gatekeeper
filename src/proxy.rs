@@ -96,9 +96,15 @@ async fn scan(State(state): State<ProxyState>, request: Request<Body>) -> Respon
         }
     };
 
+    // `/scan` mints real tokens, so they are remembered like any other: a caller
+    // that scans a value and later sends the token through the proxy gets the
+    // original back, rather than a token that resolves nowhere.
+    let anonymized = state.detector.anonymize(&input.text);
+    state.detector.remember(&anonymized.mappings);
+
     Json(json!({
         "matches": state.detector.scan(&input.text),
-        "anonymized": state.detector.anonymize(&input.text),
+        "anonymized": anonymized,
     }))
     .into_response()
 }
@@ -202,9 +208,18 @@ async fn proxy(State(state): State<ProxyState>, request: Request<Body>) -> Respo
         // `ponytail:` a body that is not JSON at all (binary upload, form post,
         // bare prose) passes through unredacted. Upgrade path: anonymize bodies
         // that are valid UTF-8 text as well, keeping only true binary opaque.
+        //
+        // Recall still runs: a token this process minted can be echoed in a form
+        // post or bare prose just as easily as in JSON, and recovering it needs
+        // only UTF-8 text, not a parse. Nothing here is anonymized, so there is
+        // nothing to remember.
         Err(_) => {
             tracing::debug!("request body is not JSON, skipping anonymization");
-            (body, HashMap::new())
+            let mut mappings = HashMap::new();
+            if let Ok(text) = std::str::from_utf8(&body) {
+                state.detector.recall(text, &mut mappings);
+            }
+            (body, mappings)
         }
     };
 
@@ -1452,11 +1467,26 @@ mod tests {
     }
 
     /// The cache only answers for digests this process minted. A token shaped
-    /// like ours but never issued stays untouched.
+    /// like ours but never issued stays untouched — asserted against a populated
+    /// cache, since an empty one would pass without consulting a digest at all.
     #[tokio::test]
     async fn foreign_token_from_another_process_is_not_restored() {
         let target = echo_upstream("application/json").await;
+        let app = router(state(&target));
         const FOREIGN: &str = "[EMAIL_ffffffffffff]";
+
+        let seeding = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({"content": PROMPT})).expect("serialized body"),
+            ))
+            .expect("built request");
+        app.clone()
+            .oneshot(seeding)
+            .await
+            .expect("seeding response");
 
         let request = Request::builder()
             .method("POST")
@@ -1466,15 +1496,43 @@ mod tests {
                 serde_json::to_vec(&json!({"content": FOREIGN})).expect("serialized body"),
             ))
             .expect("built request");
-        let seen = body_text(
-            router(state(&target))
-                .oneshot(request)
-                .await
-                .expect("response"),
-        )
-        .await;
+        let seen = body_text(app.oneshot(request).await.expect("response")).await;
 
         assert!(seen.contains(FOREIGN), "{seen}");
+    }
+
+    /// Recall does not need a JSON parse: a token echoed in a form post or bare
+    /// prose is still a token this process minted.
+    #[tokio::test]
+    async fn echoed_token_in_a_non_json_body_is_restored() {
+        let target = echo_upstream("text/plain").await;
+        let state = state(&target);
+        let original = "alice@example.com";
+        let token = state.detector.anonymize(original).text;
+        let app = router(state);
+
+        let seeding = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({"content": original})).expect("serialized body"),
+            ))
+            .expect("built request");
+        app.clone()
+            .oneshot(seeding)
+            .await
+            .expect("seeding response");
+
+        let prose = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::from(format!("follow up with {token} please")))
+            .expect("built request");
+        let seen = body_text(app.oneshot(prose).await.expect("response")).await;
+
+        assert!(seen.contains(original), "{seen}");
     }
 
     #[tokio::test]

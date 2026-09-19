@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::hash::{BuildHasher, RandomState};
 use std::net::IpAddr;
 use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use aho_corasick::{AhoCorasick, MatchKind};
 use regex::Regex;
@@ -84,13 +85,22 @@ pub struct Anonymized {
 }
 
 const DIGEST_LEN: usize = 12;
-/// Cached digests kept before the coldest half is evicted. Each entry is one
-/// digest and one original, so a few thousand is small next to a request body.
+/// Cached digests kept before the coldest half is evicted.
 const SEEN_CAPACITY: usize = 10_000;
-/// Shape of a token this process emits: `[KIND_<12 hex>]`. Used to find tokens
-/// the client echoes back in a later request.
-static TOKEN_SHAPE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\[[A-Z_]{2,16}_[0-9a-f]{12}\]").expect("token shape is valid"));
+/// Bytes of cached originals held before the coldest half is evicted. Entry
+/// count alone is a poor proxy: ten thousand PEM keys are gigabytes, ten
+/// thousand emails are under a megabyte.
+const SEEN_MAX_BYTES: usize = 1024 * 1024 * 1024;
+/// How long an unused digest is kept. A conversation that keeps referring to a
+/// value keeps it; one that has moved on lets it go, so the usual steady state
+/// is far below either cap.
+const SEEN_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
+/// Shape of a token this process emits: `[KIND_<12 hex>]`. Matched
+/// case-insensitively on the digest, since a model may echo it uppercased and
+/// `Restorer` accepts either.
+static TOKEN_SHAPE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\[[A-Z_]{2,16}_[0-9a-fA-F]{12}\]").expect("token shape is valid")
+});
 
 /// The 12-hex digest inside a token, lowercased. `None` if `token` is not one.
 fn token_digest(token: &str) -> Option<String> {
@@ -222,41 +232,115 @@ const NAME_DENY: &[&str] = &[
 
 /// Digest-to-original with recency eviction.
 ///
-/// Every hit stamps the entry with a monotonic tick, so eviction drops what has
-/// not been used rather than what happens to be in the map. A conversation that
-/// keeps referring to the same values keeps them indefinitely.
+/// Keyed by digest alone, not by the whole token. `Restorer` has always matched
+/// on the digest and ignored the label — a model that echoes `[NAME_<digest>]`
+/// for a value tokenized as `[EMAIL_<digest>]` still gets the value back — so
+/// keying this cache by the full token would make it stricter than the restore
+/// path it feeds and reintroduce the visible-token bug for relabeled echoes.
+///
+/// A value whose digest collides with another is dropped rather than guessed at,
+/// matching [`Restorer::new`]. Two originals under one digest cannot both be
+/// right, and returning the wrong plaintext is worse than returning none.
+///
+/// Every hit stamps the entry, so eviction drops what has not been used rather
+/// than what happens to be in the map. Entries idle past [`SEEN_IDLE_TTL`] are
+/// dropped outright; the size caps are a backstop for a burst inside that window.
 #[derive(Default)]
 struct Seen {
-    entries: HashMap<String, (String, u64)>,
-    tick: u64,
+    /// `None` marks a digest seen with conflicting originals: poisoned, not absent.
+    entries: HashMap<String, (Option<String>, Instant)>,
+    bytes: usize,
 }
 
 impl Seen {
-    fn insert(&mut self, digest: String, original: String) {
-        self.tick += 1;
-        if self.entries.len() >= SEEN_CAPACITY && !self.entries.contains_key(&digest) {
-            self.evict_coldest_half();
+    fn insert(&mut self, digest: String, original: &str, now: Instant) {
+        match self.entries.get_mut(&digest) {
+            // Already poisoned by an earlier conflict: stays poisoned.
+            Some((None, used)) => {
+                *used = now;
+                return;
+            }
+            Some((stored @ Some(_), used)) => {
+                *used = now;
+                if stored.as_deref() == Some(original) {
+                    return;
+                }
+                // Two originals, one digest. Neither can be trusted.
+                self.bytes = self
+                    .bytes
+                    .saturating_sub(entry_bytes(&digest, stored.as_deref()));
+                *stored = None;
+                self.bytes += entry_bytes(&digest, None);
+                return;
+            }
+            None => {}
         }
-        self.entries.insert(digest, (original, self.tick));
+
+        self.evict(now, entry_bytes(&digest, Some(original)));
+        self.bytes += entry_bytes(&digest, Some(original));
+        self.entries
+            .insert(digest, (Some(original.to_owned()), now));
     }
 
-    fn get(&mut self, digest: &str) -> Option<&str> {
-        self.tick += 1;
+    fn get(&mut self, digest: &str, now: Instant) -> Option<&str> {
         let (original, used) = self.entries.get_mut(digest)?;
-        *used = self.tick;
-        Some(original)
+        if now.duration_since(*used) > SEEN_IDLE_TTL {
+            return None;
+        }
+        *used = now;
+        original.as_deref()
     }
 
-    /// Drop the older half in one pass. Evicting in bulk keeps this amortized to
-    /// O(1) per insert: the scan costs O(n) but buys `SEEN_CAPACITY / 2` inserts
-    /// before the next one, which beats finding a single minimum every time.
-    fn evict_coldest_half(&mut self) {
-        let mut ticks: Vec<u64> = self.entries.values().map(|(_, used)| *used).collect();
-        let midpoint = ticks.len() / 2;
-        let (_, cutoff, _) = ticks.select_nth_unstable(midpoint);
+    /// Make room for `incoming` bytes: drop everything idle past the TTL, then,
+    /// if either cap is still breached, the colder half of what remains.
+    fn evict(&mut self, now: Instant, incoming: usize) {
+        let over = |entries: &HashMap<String, (Option<String>, Instant)>, bytes: usize| {
+            entries.len() >= SEEN_CAPACITY || bytes.saturating_add(incoming) > SEEN_MAX_BYTES
+        };
+        if !over(&self.entries, self.bytes) {
+            return;
+        }
+
+        self.retain(|_, used| now.duration_since(used) <= SEEN_IDLE_TTL);
+        if !over(&self.entries, self.bytes) {
+            return;
+        }
+
+        // Drop the older half in one pass. Evicting in bulk keeps this amortized
+        // to O(1) per insert: the scan costs O(n) but buys many inserts before
+        // the next one, which beats finding a single minimum every time.
+        let mut stamps: Vec<Instant> = self.entries.values().map(|(_, used)| *used).collect();
+        let midpoint = stamps.len() / 2;
+        let (_, cutoff, _) = stamps.select_nth_unstable(midpoint);
         let cutoff = *cutoff;
-        self.entries.retain(|_, (_, used)| *used > cutoff);
+        self.retain(|_, used| used > cutoff);
     }
+
+    /// `HashMap::retain` with byte accounting.
+    fn retain(&mut self, keep: impl Fn(&str, Instant) -> bool) {
+        let mut freed = 0;
+        self.entries.retain(|digest, (original, used)| {
+            if keep(digest, *used) {
+                return true;
+            }
+            freed += entry_bytes(digest, original.as_deref());
+            false
+        });
+        self.bytes = self.bytes.saturating_sub(freed);
+    }
+}
+
+/// Heap cost of one entry: both strings plus the map's own slot.
+fn entry_bytes(digest: &str, original: Option<&str>) -> usize {
+    digest.len() + original.map_or(0, str::len) + std::mem::size_of::<(String, Instant)>()
+}
+
+/// Whether a detection span contains, or is contained by, a token this process
+/// already emitted. Such a span is an echo, not a fresh value.
+fn covers_existing_token(text: &str, candidate: &Detection) -> bool {
+    TOKEN_SHAPE
+        .find_iter(text)
+        .any(|token| candidate.start < token.end() && token.start() < candidate.end)
 }
 
 pub struct Detector {
@@ -583,6 +667,11 @@ impl Detector {
 
         candidates.extend(self.dictionary_names(text));
         candidates.extend(self.custom_literals(text));
+        // A token this process already minted is not new PII. Without this, an
+        // echoed `[EMAIL_<hex>]` sitting after a secret label is swallowed by the
+        // labeled-secret pattern and re-tokenized, so restoring the outer token
+        // yields the inner token rather than the value it stands for.
+        candidates.retain(|candidate| !covers_existing_token(text, candidate));
         resolve(candidates)
     }
 
@@ -654,14 +743,13 @@ impl Detector {
         if mappings.is_empty() {
             return;
         }
-        let Ok(mut seen) = self.seen.lock() else {
-            return;
-        };
+        let now = Instant::now();
+        let mut seen = self.seen();
         for (token, original) in mappings {
             let Some(digest) = token_digest(token) else {
                 continue;
             };
-            seen.insert(digest, original.clone());
+            seen.insert(digest, original, now);
         }
     }
 
@@ -673,24 +761,44 @@ impl Detector {
         if !text.contains('[') {
             return;
         }
-        let Ok(mut seen) = self.seen.lock() else {
+        // Scan before taking the lock. The regex walks the whole body, and every
+        // request holds this one mutex; scanning inside it would serialize
+        // unrelated clients behind the largest payload in flight.
+        let tokens: Vec<&str> = TOKEN_SHAPE
+            .find_iter(text)
+            .map(|found| found.as_str())
+            .filter(|token| !mappings.contains_key(*token))
+            .collect();
+        if tokens.is_empty() {
             return;
-        };
+        }
+
+        let now = Instant::now();
+        let mut seen = self.seen();
         if seen.entries.is_empty() {
             return;
         }
-        for found in TOKEN_SHAPE.find_iter(text) {
-            let token = found.as_str();
-            if mappings.contains_key(token) {
-                continue;
-            }
+        for token in tokens {
             let Some(digest) = token_digest(token) else {
                 continue;
             };
-            if let Some(original) = seen.get(&digest) {
+            if let Some(original) = seen.get(&digest, now) {
                 mappings.insert(token.to_owned(), original.to_owned());
             }
         }
+    }
+
+    /// The digest cache, recovered if a previous panic poisoned the lock.
+    ///
+    /// `Seen` has no invariant a panic could leave half-built, and dropping the
+    /// cache permanently would silently reinstate the raw-token bug it exists to
+    /// prevent — the failure would look exactly like no cache at all.
+    fn seen(&self) -> std::sync::MutexGuard<'_, Seen> {
+        self.seen.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("digest cache lock was poisoned; continuing with its contents");
+            self.seen.clear_poison();
+            poisoned.into_inner()
+        })
     }
 
     /// Dictionary given name followed by one to three capitalized surname words.
@@ -1790,36 +1898,149 @@ mod tests {
         );
     }
 
-    /// A value still being referenced outlives `SEEN_CAPACITY` unrelated values.
-    /// A flat clear would drop it and the token would surface raw mid-conversation.
+    /// A value referred to intermittently outlives far more churn than the cap.
+    /// Touching it on every insert would only prove the easiest case, so the live
+    /// digest is touched once per `TOUCH_EVERY` unrelated inserts.
     #[test]
     fn eviction_keeps_the_digests_still_in_use() {
+        const TOUCH_EVERY: usize = 1_000;
         let detector = Detector::default();
         let live = detector.token(Kind::Custom, "still-referenced");
         detector.remember(&HashMap::from([(live.clone(), "live".to_owned())]));
 
-        // Churn well past the cap, touching the live token as a conversation would.
-        for index in 0..SEEN_CAPACITY * 2 {
+        for index in 0..SEEN_CAPACITY * 4 {
             let cold = detector.token(Kind::Custom, &format!("cold-{index}"));
             detector.remember(&HashMap::from([(cold, format!("value-{index}"))]));
 
-            let mut mappings = HashMap::new();
-            detector.recall(&live, &mut mappings);
-            assert_eq!(
-                mappings.get(&live).map(String::as_str),
-                Some("live"),
-                "evicted a digest that was in use at insert {index}"
-            );
+            if index % TOUCH_EVERY == 0 {
+                let mut mappings = HashMap::new();
+                detector.recall(&live, &mut mappings);
+                assert_eq!(
+                    mappings.get(&live).map(String::as_str),
+                    Some("live"),
+                    "evicted a digest still in use at insert {index}"
+                );
+            }
         }
 
-        let held = detector.seen.lock().expect("cache mutex").entries.len();
-        assert!(held <= SEEN_CAPACITY, "cache grew past its cap: {held}");
+        let seen = detector.seen();
+        assert!(
+            seen.entries.len() <= SEEN_CAPACITY,
+            "cache grew past its cap: {}",
+            seen.entries.len()
+        );
+        assert!(seen.bytes <= SEEN_MAX_BYTES, "byte accounting exceeded cap");
     }
 
+    /// Byte accounting tracks what is actually held, including after eviction.
+    #[test]
+    fn byte_accounting_follows_insertions_and_evictions() {
+        let detector = Detector::default();
+        for index in 0..SEEN_CAPACITY + 500 {
+            let token = detector.token(Kind::Custom, &format!("value-{index}"));
+            detector.remember(&HashMap::from([(token, "x".repeat(64))]));
+        }
+
+        let seen = detector.seen();
+        let counted: usize = seen
+            .entries
+            .iter()
+            .map(|(digest, (original, _))| entry_bytes(digest, original.as_deref()))
+            .sum();
+        assert_eq!(seen.bytes, counted, "tracked bytes drifted from reality");
+    }
+
+    /// Two originals under one digest cannot both be right, so neither is served.
+    /// `Restorer` already fails closed here; the cache must not disagree.
+    #[test]
+    fn colliding_digests_are_poisoned_rather_than_overwritten() {
+        let detector = Detector::default();
+        let token = detector.token(Kind::Email, "[EMAIL_44b6bfcabd23]");
+        let digest = token_digest(&token).expect("token carries a digest");
+        let now = Instant::now();
+
+        let mut seen = detector.seen();
+        seen.insert(digest.clone(), "first@example.com", now);
+        seen.insert(digest.clone(), "second@example.com", now);
+
+        assert_eq!(seen.get(&digest, now), None, "served a colliding digest");
+    }
+
+    /// A digest nothing has touched for the idle window is not served, and is
+    /// dropped once the cache next needs room.
+    #[test]
+    fn idle_entries_expire() {
+        let detector = Detector::default();
+        let token = detector.token(Kind::Custom, "forgotten");
+        let digest = token_digest(&token).expect("token carries a digest");
+        let now = Instant::now();
+
+        let mut seen = detector.seen();
+        seen.insert(digest.clone(), "stale", now);
+        assert_eq!(seen.get(&digest, now), Some("stale"));
+
+        let later = now + SEEN_IDLE_TTL + Duration::from_secs(1);
+        assert_eq!(seen.get(&digest, later), None, "served an expired digest");
+    }
+
+    /// A model may echo a token with its hex uppercased. `Restorer` accepts that
+    /// form, so recall must find it too or the token surfaces raw.
+    #[test]
+    fn recall_matches_an_uppercased_digest() {
+        let detector = Detector::default();
+        let token = detector.token(Kind::Custom, "shouted");
+        detector.remember(&HashMap::from([(token.clone(), "value".to_owned())]));
+
+        let digest = token_digest(&token).expect("token carries a digest");
+        let shouted = format!("[CUSTOM_{}]", digest.to_ascii_uppercase());
+        let mut mappings = HashMap::new();
+        detector.recall(&shouted, &mut mappings);
+
+        assert_eq!(restore(&shouted, &mappings), "value");
+    }
+
+    /// An echoed token that happens to sit where a secret label would put one is
+    /// still an echo. Re-tokenizing it would make the outer token restore to the
+    /// inner token instead of the value.
+    #[test]
+    fn an_echoed_token_is_not_detected_as_fresh_pii() {
+        let detector = Detector::default();
+        let token = detector.token(Kind::Email, "[EMAIL_49a7d2fe1d51]");
+
+        let labeled = format!("password: {token}");
+        let anonymized = detector.anonymize(&labeled);
+
+        assert_eq!(
+            anonymized.text, labeled,
+            "an existing token was re-tokenized: {anonymized:?}"
+        );
+    }
+
+    /// The cache must not answer for a digest this process never minted, even
+    /// when it is well-formed and the cache is populated.
+    #[test]
+    fn recall_ignores_a_digest_this_process_never_minted() {
+        let detector = Detector::default();
+        let real = detector.token(Kind::Custom, "known");
+        detector.remember(&HashMap::from([(real, "value".to_owned())]));
+
+        let foreign = "[CUSTOM_ffffffffffff]";
+        let mut mappings = HashMap::new();
+        detector.recall(foreign, &mut mappings);
+
+        assert!(mappings.is_empty(), "answered for a foreign digest");
+        assert_eq!(restore(foreign, &mappings), foreign);
+    }
+
+    /// Malformed near-tokens reach `token_digest` only if the cache is non-empty,
+    /// so this populates it first.
     #[test]
     fn recall_leaves_unknown_and_malformed_tokens_alone() {
         let detector = Detector::default();
-        let text = "[NAME_ffffffffffff] [NAME_short] [name_0123456789ab]";
+        let real = detector.token(Kind::Custom, "known");
+        detector.remember(&HashMap::from([(real, "value".to_owned())]));
+
+        let text = "[NAME_ffffffffffff] [NAME_short] [name_0123456789ab] [NAME_zzzzzzzzzzzz]";
         let mut mappings = HashMap::new();
         detector.recall(text, &mut mappings);
 
