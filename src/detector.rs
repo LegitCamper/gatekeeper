@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::hash::{BuildHasher, RandomState};
 use std::net::IpAddr;
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Mutex};
 
 use aho_corasick::{AhoCorasick, MatchKind};
 use regex::Regex;
@@ -84,6 +84,26 @@ pub struct Anonymized {
 }
 
 const DIGEST_LEN: usize = 12;
+/// Cached digests kept before the coldest half is evicted. Each entry is one
+/// digest and one original, so a few thousand is small next to a request body.
+const SEEN_CAPACITY: usize = 10_000;
+/// Shape of a token this process emits: `[KIND_<12 hex>]`. Used to find tokens
+/// the client echoes back in a later request.
+static TOKEN_SHAPE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[[A-Z_]{2,16}_[0-9a-f]{12}\]").expect("token shape is valid"));
+
+/// The 12-hex digest inside a token, lowercased. `None` if `token` is not one.
+fn token_digest(token: &str) -> Option<String> {
+    token
+        .strip_suffix(']')?
+        .rsplit_once('_')
+        .map(|(_, digest)| digest)
+        .filter(|digest| {
+            digest.len() == DIGEST_LEN && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+        .map(str::to_ascii_lowercase)
+}
+
 /// Shortest bare hex tail worth holding back as a possible split digest.
 ///
 /// A one- or two-character hex tail is far more often the real end of a
@@ -200,6 +220,45 @@ const NAME_DENY: &[&str] = &[
     "Art",
 ];
 
+/// Digest-to-original with recency eviction.
+///
+/// Every hit stamps the entry with a monotonic tick, so eviction drops what has
+/// not been used rather than what happens to be in the map. A conversation that
+/// keeps referring to the same values keeps them indefinitely.
+#[derive(Default)]
+struct Seen {
+    entries: HashMap<String, (String, u64)>,
+    tick: u64,
+}
+
+impl Seen {
+    fn insert(&mut self, digest: String, original: String) {
+        self.tick += 1;
+        if self.entries.len() >= SEEN_CAPACITY && !self.entries.contains_key(&digest) {
+            self.evict_coldest_half();
+        }
+        self.entries.insert(digest, (original, self.tick));
+    }
+
+    fn get(&mut self, digest: &str) -> Option<&str> {
+        self.tick += 1;
+        let (original, used) = self.entries.get_mut(digest)?;
+        *used = self.tick;
+        Some(original)
+    }
+
+    /// Drop the older half in one pass. Evicting in bulk keeps this amortized to
+    /// O(1) per insert: the scan costs O(n) but buys `SEEN_CAPACITY / 2` inserts
+    /// before the next one, which beats finding a single minimum every time.
+    fn evict_coldest_half(&mut self) {
+        let mut ticks: Vec<u64> = self.entries.values().map(|(_, used)| *used).collect();
+        let midpoint = ticks.len() / 2;
+        let (_, cutoff, _) = ticks.select_nth_unstable(midpoint);
+        let cutoff = *cutoff;
+        self.entries.retain(|_, (_, used)| *used > cutoff);
+    }
+}
+
 pub struct Detector {
     patterns: Vec<(Kind, Regex)>,
     given_names: AhoCorasick,
@@ -207,6 +266,19 @@ pub struct Detector {
     /// [`Kind::Custom`]. `None` until [`Detector::with_redactions`] adds them.
     custom: Option<AhoCorasick>,
     tokens: RandomState,
+    /// Digest-to-original for every value this process has tokenized.
+    ///
+    /// A token only restores if the request that carries it also re-detected the
+    /// original, and detection is context-sensitive: a name that needed a trigger
+    /// word on turn N is bare prose on turn N+1, so its token would reach the
+    /// client unrestored. Remembering the digest makes restoration survive the
+    /// context loss.
+    ///
+    /// Global, not per client: Gatekeeper is authless and has no session identity
+    /// to scope by. A digest is a 48-bit keyed hash over a per-process random
+    /// seed, so another client cannot produce one for a value it has not already
+    /// seen in its own plaintext.
+    seen: Mutex<Seen>,
 }
 
 impl Default for Detector {
@@ -458,6 +530,7 @@ impl Default for Detector {
             given_names,
             custom: None,
             tokens: RandomState::new(),
+            seen: Mutex::new(Seen::default()),
         }
     }
 }
@@ -575,6 +648,51 @@ impl Detector {
         format!("[{}_{:012x}]", kind.label(), digest & 0xffff_ffff_ffff)
     }
 
+    /// Record this request's mappings so a later request can restore the same
+    /// tokens without re-detecting the originals.
+    pub(crate) fn remember(&self, mappings: &HashMap<String, String>) {
+        if mappings.is_empty() {
+            return;
+        }
+        let Ok(mut seen) = self.seen.lock() else {
+            return;
+        };
+        for (token, original) in mappings {
+            let Some(digest) = token_digest(token) else {
+                continue;
+            };
+            seen.insert(digest, original.clone());
+        }
+    }
+
+    /// Add mappings for every remembered token appearing in `text`.
+    ///
+    /// Existing entries win: a token this request produced itself already maps to
+    /// the value the client just sent, which is fresher than anything cached.
+    pub(crate) fn recall(&self, text: &str, mappings: &mut HashMap<String, String>) {
+        if !text.contains('[') {
+            return;
+        }
+        let Ok(mut seen) = self.seen.lock() else {
+            return;
+        };
+        if seen.entries.is_empty() {
+            return;
+        }
+        for found in TOKEN_SHAPE.find_iter(text) {
+            let token = found.as_str();
+            if mappings.contains_key(token) {
+                continue;
+            }
+            let Some(digest) = token_digest(token) else {
+                continue;
+            };
+            if let Some(original) = seen.get(&digest) {
+                mappings.insert(token.to_owned(), original.to_owned());
+            }
+        }
+    }
+
     /// Dictionary given name followed by one to three capitalized surname words.
     /// Bare dictionary first names stay untouched unless an explicit context matches.
     fn dictionary_names(&self, text: &str) -> Vec<Detection> {
@@ -635,18 +753,9 @@ impl Restorer {
     pub(crate) fn new(mappings: &HashMap<String, String>) -> Self {
         let mut digests: HashMap<String, Option<String>> = HashMap::new();
         for (token, original) in mappings {
-            let Some(digest) = token
-                .strip_suffix(']')
-                .and_then(|token| token.rsplit_once('_'))
-                .map(|(_, digest)| digest)
-                .filter(|digest| {
-                    digest.len() == DIGEST_LEN
-                        && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-                })
-            else {
+            let Some(digest) = token_digest(token) else {
                 continue;
             };
-            let digest = digest.to_ascii_lowercase();
             digests
                 .entry(digest)
                 .and_modify(|stored| {
@@ -1646,6 +1755,89 @@ mod tests {
         ]);
 
         assert_eq!(restore("0123456789ab", &mappings), "original-fedcba987654");
+    }
+
+    /// Turn 1 detects a name only because of its trigger word; turn 2 sends the
+    /// token back in prose that no longer triggers. Without the digest cache the
+    /// second request builds no mapping and the token reaches the client raw.
+    #[test]
+    fn remembered_tokens_restore_after_the_trigger_context_is_gone() {
+        let detector = Detector::default();
+
+        let first = detector.anonymize("please email Priya Raghunathan today");
+        let token = first
+            .mappings
+            .keys()
+            .find(|token| token.starts_with("[NAME_"))
+            .expect("the trigger word makes the name detectable")
+            .clone();
+        detector.remember(&first.mappings);
+
+        // Turn 2: the client echoes the token, and nothing in this text is
+        // detectable on its own.
+        let echoed = format!("ok, I drafted it for {token}");
+        let second = detector.anonymize(&echoed);
+        assert!(
+            second.mappings.is_empty(),
+            "bare token text has nothing to detect"
+        );
+
+        let mut mappings = second.mappings;
+        detector.recall(&echoed, &mut mappings);
+        assert_eq!(
+            restore(&echoed, &mappings),
+            "ok, I drafted it for Priya Raghunathan"
+        );
+    }
+
+    /// A value still being referenced outlives `SEEN_CAPACITY` unrelated values.
+    /// A flat clear would drop it and the token would surface raw mid-conversation.
+    #[test]
+    fn eviction_keeps_the_digests_still_in_use() {
+        let detector = Detector::default();
+        let live = detector.token(Kind::Custom, "still-referenced");
+        detector.remember(&HashMap::from([(live.clone(), "live".to_owned())]));
+
+        // Churn well past the cap, touching the live token as a conversation would.
+        for index in 0..SEEN_CAPACITY * 2 {
+            let cold = detector.token(Kind::Custom, &format!("cold-{index}"));
+            detector.remember(&HashMap::from([(cold, format!("value-{index}"))]));
+
+            let mut mappings = HashMap::new();
+            detector.recall(&live, &mut mappings);
+            assert_eq!(
+                mappings.get(&live).map(String::as_str),
+                Some("live"),
+                "evicted a digest that was in use at insert {index}"
+            );
+        }
+
+        let held = detector.seen.lock().expect("cache mutex").entries.len();
+        assert!(held <= SEEN_CAPACITY, "cache grew past its cap: {held}");
+    }
+
+    #[test]
+    fn recall_leaves_unknown_and_malformed_tokens_alone() {
+        let detector = Detector::default();
+        let text = "[NAME_ffffffffffff] [NAME_short] [name_0123456789ab]";
+        let mut mappings = HashMap::new();
+        detector.recall(text, &mut mappings);
+
+        assert!(mappings.is_empty());
+        assert_eq!(restore(text, &mappings), text);
+    }
+
+    /// A value the current request detected itself is fresher than the cache.
+    #[test]
+    fn recall_does_not_overwrite_this_requests_mappings() {
+        let detector = Detector::default();
+        let token = detector.token(Kind::Custom, "acme");
+        detector.remember(&HashMap::from([(token.clone(), "stale".to_owned())]));
+
+        let mut mappings = HashMap::from([(token.clone(), "fresh".to_owned())]);
+        detector.recall(&token, &mut mappings);
+
+        assert_eq!(mappings[&token], "fresh");
     }
 
     #[test]

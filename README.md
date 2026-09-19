@@ -4,7 +4,7 @@ Gatekeeper is a Rust/Axum reverse proxy that removes sensitive values before LLM
 
 ```
    agent / SDK             Gatekeeper :8080            upstream provider
-   any LLM client     authless, stateless, 1 hop    Anthropic / OpenAI / ...
+   any LLM client      authless, no sessions, 1 hop    Anthropic / OpenAI / ...
 
      |                        |                             |
      | --- REQUEST ---------> | ---- tokens, no PII ----->  |
@@ -37,7 +37,9 @@ Gatekeeper is a Rust/Axum reverse proxy that removes sensitive values before LLM
         API_KEY EMAIL CARD SSN IP DOB PHONE ADDRESS NAME
         PATH CUSTOM
         "[EMAIL_a1b2c3d4e5f6]"  <-  a real address, a phone, a name
-        mapping lives for this request only, then is dropped
+        digests are cached process-wide, so a token the client
+          echoes from an earlier turn still restores once the
+          trigger context that first exposed it is gone
    6  headers - hop-by-hop dropped, client accept-encoding
       dropped, upstream asked for identity
    7  auth - UPSTREAM_API_KEY replaces the client credential;
@@ -48,7 +50,8 @@ Gatekeeper is a Rust/Axum reverse proxy that removes sensitive values before LLM
  upstream - RESPONSE back:
 
    9  status + headers forwarded; a 3xx handed to the caller
-  10  restore tokens, THIS request's digests only
+  10  restore tokens, this request's digests plus any this
+      process has minted before
         JSON | SSE | NDJSON | plain text
         token split across chunks -> carried, then stitched
         model-invented text and foreign tokens -> left alone

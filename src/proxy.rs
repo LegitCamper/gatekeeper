@@ -127,9 +127,12 @@ async fn proxy(State(state): State<ProxyState>, request: Request<Body>) -> Respo
         }
     };
 
-    // Mappings belong to this request alone: a placeholder only resolves in the
-    // response to the request that created it, so one client's values can never
-    // be spliced into another's response, and model-invented text is untouched.
+    // Mappings start empty for each request and are filled from two sources: the
+    // values this body carries, plus any token it echoes that this process has
+    // tokenized before. The cache is global — Gatekeeper is authless and has no
+    // session identity to scope by — but a digest is a 48-bit keyed hash over a
+    // per-process seed, so a client cannot name a digest for a value it has not
+    // already sent in its own plaintext. Model-invented text is untouched.
     //
     // Dispatch on the body's *shape*, not its declared content-type. Providers
     // parse a JSON body whatever the header claims, so a client that sends JSON
@@ -161,7 +164,26 @@ async fn proxy(State(state): State<ProxyState>, request: Request<Body>) -> Respo
             anonymize_json(&mut value, &state.detector, &mut mappings);
             tracing::debug!(count = mappings.len(), "anonymized request");
             match serde_json::to_vec(&value) {
-                Ok(encoded) => (Bytes::from(encoded), mappings),
+                Ok(encoded) => {
+                    // A token the client echoes from an earlier turn only restores
+                    // if this request re-detected the original, and detection is
+                    // context-sensitive — a name that needed a trigger word on one
+                    // turn is bare prose on the next. Recover those mappings from
+                    // the digest cache, and record this request's own so later
+                    // turns can do the same.
+                    state.detector.remember(&mappings);
+                    let before = mappings.len();
+                    if let Ok(text) = std::str::from_utf8(&encoded) {
+                        state.detector.recall(text, &mut mappings);
+                    }
+                    if mappings.len() > before {
+                        tracing::debug!(
+                            recalled = mappings.len() - before,
+                            "recovered tokens from earlier requests"
+                        );
+                    }
+                    (Bytes::from(encoded), mappings)
+                }
                 Err(error) => {
                     return json_error(
                         StatusCode::BAD_GATEWAY,
@@ -1394,8 +1416,11 @@ mod tests {
         assert!(seen.contains("id_ed25519.pub"), "{seen}");
     }
 
+    /// A token echoed from an earlier turn restores from the digest cache, even
+    /// though this request re-detected nothing. Detection is context-sensitive,
+    /// so the alternative is a raw token surfacing in the client mid-conversation.
     #[tokio::test]
-    async fn token_from_a_previous_request_is_not_restored() {
+    async fn token_from_a_previous_request_is_restored() {
         let target = echo_upstream("application/json").await;
         let state = state(&target);
         let original = "alice@example.com";
@@ -1413,8 +1438,6 @@ mod tests {
         let response = app.clone().oneshot(stored).await.expect("first response");
         assert!(body_text(response).await.contains(original));
 
-        // A later request carrying only the placeholder has no mapping of its
-        // own, so the earlier request's value must not reappear.
         let follow_up = Request::builder()
             .method("POST")
             .uri("/v1/messages")
@@ -1425,8 +1448,33 @@ mod tests {
             .expect("built request");
         let seen = body_text(app.oneshot(follow_up).await.expect("second response")).await;
 
-        assert!(!seen.contains(original), "{seen}");
-        assert!(seen.contains(&token), "{seen}");
+        assert!(seen.contains(original), "{seen}");
+    }
+
+    /// The cache only answers for digests this process minted. A token shaped
+    /// like ours but never issued stays untouched.
+    #[tokio::test]
+    async fn foreign_token_from_another_process_is_not_restored() {
+        let target = echo_upstream("application/json").await;
+        const FOREIGN: &str = "[EMAIL_ffffffffffff]";
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({"content": FOREIGN})).expect("serialized body"),
+            ))
+            .expect("built request");
+        let seen = body_text(
+            router(state(&target))
+                .oneshot(request)
+                .await
+                .expect("response"),
+        )
+        .await;
+
+        assert!(seen.contains(FOREIGN), "{seen}");
     }
 
     #[tokio::test]
