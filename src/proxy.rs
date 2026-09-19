@@ -219,6 +219,12 @@ async fn proxy(State(state): State<ProxyState>, request: Request<Body>) -> Respo
             if let Ok(text) = std::str::from_utf8(&body) {
                 state.detector.recall(text, &mut mappings);
             }
+            if !mappings.is_empty() {
+                tracing::debug!(
+                    recalled = mappings.len(),
+                    "recovered tokens from earlier requests"
+                );
+            }
             (body, mappings)
         }
     };

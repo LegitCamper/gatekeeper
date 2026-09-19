@@ -1,6 +1,6 @@
 //! PII detection, anonymization, and restoration.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, RandomState};
 use std::net::IpAddr;
 use std::sync::{LazyLock, Mutex};
@@ -99,8 +99,12 @@ const SEEN_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
 /// case-insensitively on the digest, since a model may echo it uppercased and
 /// `Restorer` accepts either.
 static TOKEN_SHAPE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\[[A-Z_]{2,16}_[0-9a-fA-F]{12}\]").expect("token shape is valid")
+    Regex::new(r"\[[A-Za-z_]{2,16}_[0-9a-fA-F]{12}\]").expect("token shape is valid")
 });
+/// Exact 12-hex runs worth looking up in the process cache. [`Restorer`] accepts
+/// bare and relabeled digests, so recall must seed it from those forms too.
+static DIGEST_SHAPE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[0-9a-fA-F]{12}").expect("digest shape is valid"));
 
 /// The 12-hex digest inside a token, lowercased. `None` if `token` is not one.
 fn token_digest(token: &str) -> Option<String> {
@@ -283,10 +287,20 @@ impl Seen {
     }
 
     fn get(&mut self, digest: &str, now: Instant) -> Option<&str> {
-        let (original, used) = self.entries.get_mut(digest)?;
-        if now.duration_since(*used) > SEEN_IDLE_TTL {
+        let expired = self
+            .entries
+            .get(digest)
+            .is_some_and(|(_, used)| now.duration_since(*used) > SEEN_IDLE_TTL);
+        if expired {
+            if let Some((original, _)) = self.entries.remove(digest) {
+                self.bytes = self
+                    .bytes
+                    .saturating_sub(entry_bytes(digest, original.as_deref()));
+            }
             return None;
         }
+
+        let (original, used) = self.entries.get_mut(digest)?;
         *used = now;
         original.as_deref()
     }
@@ -758,18 +772,40 @@ impl Detector {
     /// Existing entries win: a token this request produced itself already maps to
     /// the value the client just sent, which is fresher than anything cached.
     pub(crate) fn recall(&self, text: &str, mappings: &mut HashMap<String, String>) {
-        if !text.contains('[') {
-            return;
-        }
         // Scan before taking the lock. The regex walks the whole body, and every
         // request holds this one mutex; scanning inside it would serialize
         // unrelated clients behind the largest payload in flight.
-        let tokens: Vec<&str> = TOKEN_SHAPE
-            .find_iter(text)
-            .map(|found| found.as_str())
-            .filter(|token| !mappings.contains_key(*token))
+        let mapped: HashSet<String> = mappings
+            .keys()
+            .filter_map(|token| token_digest(token))
             .collect();
-        if tokens.is_empty() {
+        let mut candidates: HashMap<String, String> = TOKEN_SHAPE
+            .find_iter(text)
+            .filter_map(|found| {
+                let token = found.as_str();
+                token_digest(token).map(|digest| (digest, token.to_owned()))
+            })
+            .filter(|(digest, _)| !mapped.contains(digest))
+            .collect();
+        for found in DIGEST_SHAPE.find_iter(text) {
+            let start = found.start();
+            let end = found.end();
+            let bytes = text.as_bytes();
+            if bytes
+                .get(start.wrapping_sub(1))
+                .is_some_and(u8::is_ascii_alphanumeric)
+                || bytes.get(end).is_some_and(u8::is_ascii_alphanumeric)
+            {
+                continue;
+            }
+            let digest = found.as_str().to_ascii_lowercase();
+            if !mapped.contains(&digest) {
+                candidates
+                    .entry(digest.clone())
+                    .or_insert_with(|| format!("[REDACTED_{digest}]"));
+            }
+        }
+        if candidates.is_empty() {
             return;
         }
 
@@ -778,12 +814,11 @@ impl Detector {
         if seen.entries.is_empty() {
             return;
         }
-        for token in tokens {
-            let Some(digest) = token_digest(token) else {
-                continue;
-            };
-            if let Some(original) = seen.get(&digest, now) {
-                mappings.insert(token.to_owned(), original.to_owned());
+        for (digest, token) in candidates {
+            if let Some(original) = seen.get(&digest, now).map(str::to_owned) {
+                // `Restorer` uses the digest regardless of label, brackets, or case,
+                // so a synthetic canonical form covers every mutated echo.
+                mappings.insert(token, original);
             }
         }
     }
@@ -1981,6 +2016,35 @@ mod tests {
 
         let later = now + SEEN_IDLE_TTL + Duration::from_secs(1);
         assert_eq!(seen.get(&digest, later), None, "served an expired digest");
+        assert!(
+            !seen.entries.contains_key(&digest),
+            "kept expired plaintext"
+        );
+        assert_eq!(seen.bytes, 0, "kept expired bytes accounted");
+    }
+
+    /// Cache recall seeds every digest form that `Restorer` accepts, not only the
+    /// exact uppercase-label token emitted by Gatekeeper.
+    #[test]
+    fn recall_matches_reformatted_digests() {
+        let detector = Detector::default();
+        let token = detector.token(Kind::Email, "a@example.com");
+        detector.remember(&HashMap::from([(
+            token.clone(),
+            "a@example.com".to_owned(),
+        )]));
+        let digest = token_digest(&token).expect("token carries a digest");
+
+        for echoed in [
+            format!("[email_{digest}]"),
+            format!("EMAIL:{digest}"),
+            format!("REDACTED_{digest}"),
+            digest,
+        ] {
+            let mut mappings = HashMap::new();
+            detector.recall(&echoed, &mut mappings);
+            assert_eq!(restore(&echoed, &mappings), "a@example.com", "{echoed}");
+        }
     }
 
     /// A model may echo a token with its hex uppercased. `Restorer` accepts that
