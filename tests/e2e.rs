@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use axum::body::{Body, to_bytes};
-use axum::extract::Request;
+use axum::extract::{Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -433,13 +433,12 @@ async fn serve(app: Router) -> String {
     format!("http://{address}")
 }
 
-/// Remembers the first placeholder it is ever sent and replays it in every
-/// later response, standing in for a model that emits a token it was not given
-/// in this request.
-async fn replay(request: Request) -> Response {
-    static SEEN: std::sync::OnceLock<std::sync::Mutex<Option<String>>> = std::sync::OnceLock::new();
-    let seen = SEEN.get_or_init(|| std::sync::Mutex::new(None));
-
+/// Replays the placeholder learned from the first request. Later requests need
+/// carry no token or PII, matching a model that recalls an earlier turn.
+async fn replay(
+    State(seen): State<Arc<std::sync::Mutex<Option<String>>>>,
+    request: Request,
+) -> Response {
     let bytes = to_bytes(request.into_body(), usize::MAX)
         .await
         .expect("upstream read the request body");
@@ -457,6 +456,68 @@ async fn replay(request: Request) -> Response {
     (
         [(header::CONTENT_TYPE, "application/json")],
         serde_json::json!({ "content": replayed }).to_string(),
+    )
+        .into_response()
+}
+
+/// Replays the learned placeholder as SSE, split across real TCP writes. The
+/// replaying request itself carries no token or PII.
+async fn replay_stream(
+    State(seen): State<Arc<std::sync::Mutex<Option<String>>>>,
+    request: Request,
+) -> Response {
+    let bytes = to_bytes(request.into_body(), usize::MAX)
+        .await
+        .expect("upstream read the request body");
+    let text = String::from_utf8_lossy(&bytes);
+    if let Some(found) = token_pattern().find(&text) {
+        let mut slot = seen.lock().expect("replay mutex");
+        slot.get_or_insert_with(|| found.as_str().to_owned());
+    }
+    let replayed = seen
+        .lock()
+        .expect("replay mutex")
+        .clone()
+        .unwrap_or_default();
+    let split = replayed.len() / 2;
+    let head = format!("data: {{\"text\":\"{}", &replayed[..split]);
+    let tail = format!("{}\"}}\n\ndata: [DONE]\n\n", &replayed[split..]);
+    let body = async_stream::stream! {
+        yield Ok::<_, std::io::Error>(Bytes::from(head));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        yield Ok(Bytes::from(tail));
+    };
+
+    (
+        [(header::CONTENT_TYPE, "text/event-stream")],
+        Body::from_stream(body),
+    )
+        .into_response()
+}
+
+/// Plain text with a multibyte character split across TCP writes before a
+/// placeholder. This catches chunk-local UTF-8 decoding that can skip restore.
+async fn utf8_split_stream(request: Request) -> Response {
+    let bytes = to_bytes(request.into_body(), usize::MAX)
+        .await
+        .expect("upstream read the request body");
+    let text = String::from_utf8(bytes.to_vec()).expect("utf-8 request body");
+    let token = token_pattern()
+        .find(&text)
+        .expect("upstream was handed an anonymized body")
+        .as_str()
+        .to_owned();
+    let unicode = "é".as_bytes();
+    let tail = [vec![unicode[1]], format!(" {token}").into_bytes()].concat();
+    let body = async_stream::stream! {
+        yield Ok::<_, std::io::Error>(Bytes::from(vec![unicode[0]]));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        yield Ok(Bytes::from(tail));
+    };
+
+    (
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        Body::from_stream(body),
     )
         .into_response()
 }
@@ -502,10 +563,12 @@ async fn spawn_redirect_upstream() -> (String, Arc<AtomicUsize>) {
 }
 
 async fn spawn_upstream() -> String {
+    let replayed = Arc::new(std::sync::Mutex::new(None));
     serve(
         Router::new()
             .route("/v1/messages", post(echo))
             .route("/v1/stream", post(stream))
+            .route("/v1/utf8-split", post(utf8_split_stream))
             .route("/v1/gzip-stream", post(gzipped_stream))
             .route("/v1/gzip-always", post(always_gzipped_stream))
             .route("/v1/anthropic-stream", post(anthropic_stream))
@@ -516,7 +579,9 @@ async fn spawn_upstream() -> String {
             .route("/v1/malformed", post(malformed_json))
             .route("/v1/empty", post(empty_json))
             .route("/v1/binary", post(binary_json))
-            .route("/v1/replay", post(replay)),
+            .route("/v1/replay", post(replay))
+            .route("/v1/replay-stream", post(replay_stream))
+            .with_state(replayed),
     )
     .await
 }
@@ -674,24 +739,22 @@ async fn compressed_bytes_are_forwarded_without_being_mangled() {
     );
 }
 
-/// A placeholder minted for one request must stay opaque in a later request's
-/// response: restoration is scoped to the request that created the mapping.
+/// A later response restores a placeholder minted by an earlier request even
+/// when the second request carries no token or PII. Restoration state belongs
+/// to the process, not to an individual request.
 #[tokio::test]
-async fn placeholder_from_an_earlier_request_is_not_restored() {
+async fn placeholder_from_an_earlier_request_is_restored_process_wide() {
     let upstream = spawn_upstream().await;
     let gatekeeper = spawn_gatekeeper(&upstream).await;
 
-    // First request mints a mapping for the email and teaches the upstream its
-    // placeholder.
     client()
         .post(format!("{gatekeeper}/v1/replay"))
         .header(header::CONTENT_TYPE, "application/json")
-        .json(&serde_json::json!({"messages": [{"content": prompt()}]}))
+        .json(&serde_json::json!({"messages": [{"content": email()}]}))
         .send()
         .await
         .expect("gatekeeper responded");
 
-    // Second request carries no PII, so it owns no mappings.
     let body = client()
         .post(format!("{gatekeeper}/v1/replay"))
         .header(header::CONTENT_TYPE, "application/json")
@@ -704,12 +767,47 @@ async fn placeholder_from_an_earlier_request_is_not_restored() {
         .expect("utf-8 response body");
 
     assert!(
-        !body.contains(&email()),
-        "another request's value leaked into this response: {body}"
+        body.contains(&email()),
+        "earlier request's value was not restored: {body}"
     );
     assert!(
-        token_pattern().is_match(&body),
-        "replayed placeholder should reach the client verbatim: {body}"
+        !token_pattern().is_match(&body),
+        "replayed placeholder survived into the client: {body}"
+    );
+}
+
+#[tokio::test]
+async fn earlier_request_placeholder_restores_in_a_later_stream() {
+    let upstream = spawn_upstream().await;
+    let gatekeeper = spawn_gatekeeper(&upstream).await;
+
+    client()
+        .post(format!("{gatekeeper}/v1/replay-stream"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .json(&serde_json::json!({"messages": [{"content": email()}]}))
+        .send()
+        .await
+        .expect("gatekeeper responded");
+
+    let body = client()
+        .post(format!("{gatekeeper}/v1/replay-stream"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .json(&serde_json::json!({"messages": [{"content": "summarize the changelog"}]}))
+        .send()
+        .await
+        .expect("gatekeeper responded")
+        .text()
+        .await
+        .expect("utf-8 response body");
+
+    assert!(body.contains(&email()), "email was not restored: {body}");
+    assert!(
+        !token_pattern().is_match(&body),
+        "replayed placeholder survived into the client: {body}"
+    );
+    assert!(
+        body.ends_with("data: [DONE]\n\n"),
+        "stream truncated: {body}"
     );
 }
 
@@ -1071,6 +1169,27 @@ async fn binary_json_with_mappings_returns_gateway_error() {
     let error: serde_json::Value = response.json().await.expect("valid error JSON");
     assert_eq!(error["type"], "error");
     assert_eq!(error["error"]["type"], "gateway_error");
+}
+
+#[tokio::test]
+async fn utf8_code_point_split_across_tcp_chunks_does_not_skip_restoration() {
+    let upstream = spawn_upstream().await;
+    let gatekeeper = spawn_gatekeeper(&upstream).await;
+    let email = email();
+
+    let bytes = client()
+        .post(format!("{gatekeeper}/v1/utf8-split"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .json(&serde_json::json!({"content": email.clone()}))
+        .send()
+        .await
+        .expect("gatekeeper responded")
+        .bytes()
+        .await
+        .expect("response body");
+    let body = String::from_utf8(bytes.to_vec()).expect("valid UTF-8 response");
+
+    assert_eq!(body, format!("é {email}"));
 }
 
 #[tokio::test]

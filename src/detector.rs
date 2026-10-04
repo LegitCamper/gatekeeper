@@ -1,9 +1,9 @@
 //! PII detection, anonymization, and restoration.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::hash::{BuildHasher, RandomState};
 use std::net::IpAddr;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use aho_corasick::{AhoCorasick, MatchKind};
@@ -95,14 +95,14 @@ const SEEN_MAX_BYTES: usize = 1024 * 1024 * 1024;
 /// value keeps it; one that has moved on lets it go, so the usual steady state
 /// is far below either cap.
 const SEEN_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
-/// Shape of a token this process emits: `[KIND_<12 hex>]`. Matched
-/// case-insensitively on the digest, since a model may echo it uppercased and
-/// `Restorer` accepts either.
+/// Shape of a token this process emits: `[KIND_<12 hex>]`. Labels and digests
+/// are case-insensitive because models may change either while echoing it.
 static TOKEN_SHAPE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\[[A-Za-z_]{2,16}_[0-9a-fA-F]{12}\]").expect("token shape is valid")
+    Regex::new(r"(?i:\[[a-z_]{2,16}_[0-9a-f]{12}\])").expect("token shape is valid")
 });
-/// Exact 12-hex runs worth looking up in the process cache. [`Restorer`] accepts
-/// bare and relabeled digests, so recall must seed it from those forms too.
+
+/// Exact 12-hex runs used by the transitional [`Detector::recall`] test helper.
+#[cfg(test)]
 static DIGEST_SHAPE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[0-9a-fA-F]{12}").expect("digest shape is valid"));
 
@@ -118,15 +118,8 @@ fn token_digest(token: &str) -> Option<String> {
         .map(str::to_ascii_lowercase)
 }
 
-/// Shortest bare hex tail worth holding back as a possible split digest.
-///
-/// A one- or two-character hex tail is far more often the real end of a
-/// provider string (`claude-haiku-4-5`, `gpt-4`, `index: 3`) than the start of
-/// a digest the model stripped to bare hex. Holding one back withholds a
-/// character the field may never get a chance to reclaim — the field path never
-/// recurs — so the value is silently truncated, and on a `type` field that ends
-/// the stream for the client. A split *token* still carries at any length: the
-/// `[LABEL_` branch below is specific enough to be safe.
+/// Shortest bare hex tail worth holding for mapping-only restoration. Live
+/// restorers can safely carry one character because they consult known digests.
 const MIN_DIGEST_CARRY: usize = 4;
 const MAX_TOKEN_CARRY: usize = 64;
 const TOKEN_DECORATION_LABELS: &[&str] = &[
@@ -258,6 +251,10 @@ struct Seen {
 
 impl Seen {
     fn insert(&mut self, digest: String, original: &str, now: Instant) {
+        let incoming = entry_bytes(&digest, Some(original));
+        if incoming > SEEN_MAX_BYTES {
+            return;
+        }
         match self.entries.get_mut(&digest) {
             // Already poisoned by an earlier conflict: stays poisoned.
             Some((None, used)) => {
@@ -280,8 +277,8 @@ impl Seen {
             None => {}
         }
 
-        self.evict(now, entry_bytes(&digest, Some(original)));
-        self.bytes += entry_bytes(&digest, Some(original));
+        self.evict(now, incoming);
+        self.bytes += incoming;
         self.entries
             .insert(digest, (Some(original.to_owned()), now));
     }
@@ -305,9 +302,18 @@ impl Seen {
         original.as_deref()
     }
 
+    fn has_prefix(&mut self, prefix: &str, now: Instant) -> bool {
+        self.retain(|_, used| now.duration_since(used) <= SEEN_IDLE_TTL);
+        self.entries
+            .iter()
+            .any(|(digest, (original, _))| original.is_some() && digest.starts_with(prefix))
+    }
+
     /// Make room for `incoming` bytes: drop everything idle past the TTL, then,
     /// if either cap is still breached, the colder half of what remains.
     fn evict(&mut self, now: Instant, incoming: usize) {
+        self.retain(|_, used| now.duration_since(used) <= SEEN_IDLE_TTL);
+
         let over = |entries: &HashMap<String, (Option<String>, Instant)>, bytes: usize| {
             entries.len() >= SEEN_CAPACITY || bytes.saturating_add(incoming) > SEEN_MAX_BYTES
         };
@@ -315,19 +321,29 @@ impl Seen {
             return;
         }
 
-        self.retain(|_, used| now.duration_since(used) <= SEEN_IDLE_TTL);
-        if !over(&self.entries, self.bytes) {
-            return;
+        // Deterministic tie handling matters because a burst can stamp many
+        // entries with the same clock tick. Sort by recency then digest and drop
+        // exactly the coldest half instead of retaining or dropping every tie.
+        let mut cold: Vec<(Instant, String)> = self
+            .entries
+            .iter()
+            .map(|(digest, (_, used))| (*used, digest.clone()))
+            .collect();
+        cold.sort_unstable();
+        let minimum = self.entries.len().div_ceil(2);
+        for (index, (_, digest)) in cold.into_iter().enumerate() {
+            if index >= minimum
+                && self.entries.len() < SEEN_CAPACITY
+                && self.bytes.saturating_add(incoming) <= SEEN_MAX_BYTES
+            {
+                break;
+            }
+            if let Some((original, _)) = self.entries.remove(&digest) {
+                self.bytes = self
+                    .bytes
+                    .saturating_sub(entry_bytes(&digest, original.as_deref()));
+            }
         }
-
-        // Drop the older half in one pass. Evicting in bulk keeps this amortized
-        // to O(1) per insert: the scan costs O(n) but buys many inserts before
-        // the next one, which beats finding a single minimum every time.
-        let mut stamps: Vec<Instant> = self.entries.values().map(|(_, used)| *used).collect();
-        let midpoint = stamps.len() / 2;
-        let (_, cutoff, _) = stamps.select_nth_unstable(midpoint);
-        let cutoff = *cutoff;
-        self.retain(|_, used| used > cutoff);
     }
 
     /// `HashMap::retain` with byte accounting.
@@ -364,18 +380,10 @@ pub struct Detector {
     /// [`Kind::Custom`]. `None` until [`Detector::with_redactions`] adds them.
     custom: Option<AhoCorasick>,
     tokens: RandomState,
-    /// Digest-to-original for every value this process has tokenized.
+    /// Digest-to-original cache shared by all requests handled by this process.
     ///
-    /// A token only restores if the request that carries it also re-detected the
-    /// original, and detection is context-sensitive: a name that needed a trigger
-    /// word on turn N is bare prose on turn N+1, so its token would reach the
-    /// client unrestored. Remembering the digest makes restoration survive the
-    /// context loss.
-    ///
-    /// Global, not per client: Gatekeeper is authless and has no session identity
-    /// to scope by. A digest is a 48-bit keyed hash over a per-process random
-    /// seed, so another client cannot produce one for a value it has not already
-    /// seen in its own plaintext.
+    /// Gatekeeper is authless and has no client identity to scope by. The keyed
+    /// digest prevents offline derivation, but does not provide tenant isolation.
     seen: Mutex<Seen>,
 }
 
@@ -681,12 +689,46 @@ impl Detector {
 
         candidates.extend(self.dictionary_names(text));
         candidates.extend(self.custom_literals(text));
-        // A token this process already minted is not new PII. Without this, an
-        // echoed `[EMAIL_<hex>]` sitting after a secret label is swallowed by the
-        // labeled-secret pattern and re-tokenized, so restoring the outer token
-        // yields the inner token rather than the value it stands for.
-        candidates.retain(|candidate| !covers_existing_token(text, candidate));
+        // Placeholders this detector already minted are echoes, not fresh PII.
+        // Check known digest forms as well as canonical brackets because models
+        // routinely alter labels, separators, case, and digest formatting.
+        candidates.retain(|candidate| {
+            !covers_existing_token(text, candidate)
+                && !self.covers_known_placeholder(text, candidate)
+        });
         resolve(candidates)
+    }
+
+    fn covers_known_placeholder(&self, text: &str, candidate: &Detection) -> bool {
+        let mut seen = self.seen();
+        let now = Instant::now();
+        let mut cursor = candidate.start;
+        while cursor < candidate.end {
+            let Some((digest, end)) = split_digest(text, cursor).or_else(|| {
+                let bytes = text.as_bytes();
+                (cursor + DIGEST_LEN <= candidate.end
+                    && bytes[cursor..cursor + DIGEST_LEN]
+                        .iter()
+                        .all(u8::is_ascii_hexdigit))
+                .then(|| {
+                    (
+                        text[cursor..cursor + DIGEST_LEN].to_ascii_lowercase(),
+                        cursor + DIGEST_LEN,
+                    )
+                })
+            }) else {
+                cursor += text[cursor..].chars().next().map_or(1, char::len_utf8);
+                continue;
+            };
+            if seen.get(&digest, now).is_some()
+                && (decoration_start(text, cursor).is_some()
+                    || (cursor > 0 && text.as_bytes()[cursor - 1] == b'['))
+            {
+                return true;
+            }
+            cursor = end;
+        }
+        false
     }
 
     /// Configured literal values, matched whole: `acme` fires in `Acme Corp` but
@@ -767,60 +809,52 @@ impl Detector {
         }
     }
 
-    /// Add mappings for every remembered token appearing in `text`.
-    ///
-    /// Existing entries win: a token this request produced itself already maps to
-    /// the value the client just sent, which is fresher than anything cached.
-    pub(crate) fn recall(&self, text: &str, mappings: &mut HashMap<String, String>) {
-        // Scan before taking the lock. The regex walks the whole body, and every
-        // request holds this one mutex; scanning inside it would serialize
-        // unrelated clients behind the largest payload in flight.
-        let mapped: HashSet<String> = mappings
-            .keys()
-            .filter_map(|token| token_digest(token))
-            .collect();
+    /// Test-only compatibility lookup for request mappings.
+    #[cfg(test)]
+    fn recall(&self, text: &str, mappings: &mut HashMap<String, String>) {
         let mut candidates: HashMap<String, String> = TOKEN_SHAPE
             .find_iter(text)
             .filter_map(|found| {
                 let token = found.as_str();
                 token_digest(token).map(|digest| (digest, token.to_owned()))
             })
-            .filter(|(digest, _)| !mapped.contains(digest))
             .collect();
         for found in DIGEST_SHAPE.find_iter(text) {
-            let start = found.start();
-            let end = found.end();
             let bytes = text.as_bytes();
             if bytes
-                .get(start.wrapping_sub(1))
+                .get(found.start().wrapping_sub(1))
                 .is_some_and(u8::is_ascii_alphanumeric)
-                || bytes.get(end).is_some_and(u8::is_ascii_alphanumeric)
+                || bytes
+                    .get(found.end())
+                    .is_some_and(u8::is_ascii_alphanumeric)
             {
                 continue;
             }
             let digest = found.as_str().to_ascii_lowercase();
-            if !mapped.contains(&digest) {
-                candidates
-                    .entry(digest.clone())
-                    .or_insert_with(|| format!("[REDACTED_{digest}]"));
-            }
-        }
-        if candidates.is_empty() {
-            return;
+            candidates
+                .entry(digest.clone())
+                .or_insert_with(|| format!("[REDACTED_{digest}]"));
         }
 
         let now = Instant::now();
         let mut seen = self.seen();
-        if seen.entries.is_empty() {
-            return;
-        }
         for (digest, token) in candidates {
+            if mappings
+                .keys()
+                .any(|mapped| token_digest(mapped).as_deref() == Some(&digest))
+            {
+                continue;
+            }
             if let Some(original) = seen.get(&digest, now).map(str::to_owned) {
-                // `Restorer` uses the digest regardless of label, brackets, or case,
-                // so a synthetic canonical form covers every mutated echo.
                 mappings.insert(token, original);
             }
         }
+    }
+
+    /// Build a response restorer backed by this detector's live process-global
+    /// digest store. Request mappings supplied later still take precedence.
+    pub(crate) fn restorer(self: &Arc<Self>) -> Restorer {
+        Restorer::live(Arc::clone(self))
     }
 
     /// The digest cache, recovered if a previous panic poisoned the lock.
@@ -879,11 +913,12 @@ impl Detector {
     }
 }
 
-/// Restores values using canonical tokens or their request-local 12-hex digest.
+/// Restores values from request mappings and, when created by
+/// [`Detector::restorer`], from the detector's live process-global store.
 pub(crate) struct Restorer {
     tokens: HashMap<String, String>,
     digests: HashMap<String, Option<String>>,
-    digests_with_case: Vec<String>,
+    detector: Option<Arc<Detector>>,
 }
 
 #[derive(Default)]
@@ -909,17 +944,53 @@ impl Restorer {
                 .or_insert_with(|| Some(original.clone()));
         }
 
-        let digests_with_case = digests
-            .iter()
-            .filter(|(_, original)| original.is_some())
-            .flat_map(|(digest, _)| [digest.clone(), digest.to_ascii_uppercase()])
-            .collect();
-
         Self {
             tokens: mappings.clone(),
             digests,
-            digests_with_case,
+            detector: None,
         }
+    }
+
+    fn live(detector: Arc<Detector>) -> Self {
+        Self {
+            tokens: HashMap::new(),
+            digests: HashMap::new(),
+            detector: Some(detector),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_mappings(mut self, mappings: &HashMap<String, String>) -> Self {
+        let mapped = Self::new(mappings);
+        self.tokens = mapped.tokens;
+        self.digests = mapped.digests;
+        self
+    }
+
+    fn known_original(&self, digest: &str) -> Option<String> {
+        if let Some(mapped) = self.digests.get(digest) {
+            return mapped.clone();
+        }
+        let detector = self.detector.as_ref()?;
+        detector
+            .seen()
+            .get(digest, Instant::now())
+            .map(str::to_owned)
+    }
+
+    fn known_digest_prefix(&self, prefix: &str) -> bool {
+        let prefix = prefix.to_ascii_lowercase();
+        if self
+            .digests
+            .iter()
+            .any(|(digest, original)| original.is_some() && digest.starts_with(&prefix))
+        {
+            return true;
+        }
+        let Some(detector) = &self.detector else {
+            return false;
+        };
+        detector.seen().has_prefix(&prefix, Instant::now())
     }
 
     pub(crate) fn restore(&self, text: &str) -> String {
@@ -930,7 +1001,7 @@ impl Restorer {
     }
 
     pub(crate) fn restore_fragment(&self, text: &str, carry: &mut RestoreCarry) -> String {
-        if self.tokens.is_empty() {
+        if self.tokens.is_empty() && self.detector.is_none() {
             return text.to_owned();
         }
 
@@ -985,7 +1056,7 @@ impl Restorer {
             let on_boundary = !(cursor > 0 && bytes[cursor - 1].is_ascii_alphanumeric());
             if on_boundary
                 && let Some((digest, digest_end)) = found
-                && let Some(Some(original)) = self.digests.get(&digest)
+                && let Some(original) = self.known_original(&digest)
             {
                 let decorated = decoration_start(&full_text, cursor);
                 let bracketed =
@@ -997,7 +1068,7 @@ impl Restorer {
                         output.truncate(output.len() - decoration.len());
                     }
                 }
-                output.push_str(original);
+                output.push_str(&original);
                 cursor = digest_end;
                 if start.is_some() {
                     if bytes.get(cursor) == Some(&b']') {
@@ -1018,7 +1089,7 @@ impl Restorer {
             cursor += next;
         }
 
-        let keep = partial_suffix_len(&output, &self.tokens, &self.digests_with_case);
+        let keep = partial_suffix_len(&output, self);
         if keep > 0 {
             carry.text.push_str(&output[output.len() - keep..]);
             output.truncate(output.len() - keep);
@@ -1102,7 +1173,7 @@ fn decoration_start(text: &str, digest_start: usize) -> Option<usize> {
     let mut label_start = separator;
     while label_start > 0 {
         let byte = bytes[label_start - 1];
-        if byte.is_ascii_uppercase() || byte == b'_' {
+        if byte.is_ascii_alphabetic() || byte == b'_' {
             label_start -= 1;
         } else {
             break;
@@ -1121,7 +1192,7 @@ fn decoration_start(text: &str, digest_start: usize) -> Option<usize> {
     })
 }
 
-fn partial_suffix_len(text: &str, tokens: &HashMap<String, String>, digests: &[String]) -> usize {
+fn partial_suffix_len(text: &str, restorer: &Restorer) -> usize {
     let mut starts: Vec<usize> = text
         .char_indices()
         .map(|(index, _)| index)
@@ -1139,21 +1210,30 @@ fn partial_suffix_len(text: &str, tokens: &HashMap<String, String>, digests: &[S
             // final `a` in `content_block_delta` can be withheld as a possible
             // digest prefix, and a later event receives that stray character.
             let bounded = *start == 0 || !text.as_bytes()[start - 1].is_ascii_alphanumeric();
-            if tokens.keys().any(|token| token.starts_with(suffix)) {
+            if restorer
+                .tokens
+                .keys()
+                .any(|token| token.starts_with(suffix))
+            {
                 return true;
             }
             // A bare hex tail must be long enough to be worth the truncation
             // risk; decorated forms still carry, since `[`/`*` mark intent.
+            let minimum = if restorer.detector.is_some() {
+                1
+            } else {
+                MIN_DIGEST_CARRY
+            };
             bounded
-                && (((suffix.len() >= MIN_DIGEST_CARRY || suffix.len() == text.len())
-                    && (digests.iter().any(|digest| digest.starts_with(suffix))
+                && (((suffix.len() >= minimum || suffix.len() == text.len())
+                    && (known_digest_prefix(suffix, restorer)
                         // A digest a model split with formatting can also straddle a
                         // chunk boundary (`012345**67` then `89ab**`). Without this the
                         // carry ends at the `*` and the two halves are emitted verbatim,
                         // putting a live hash in the client's view — streaming is the
                         // normal path, so the noise-tolerant match has to apply here too.
-                        || noise_stripped_digest_prefix(suffix, digests)))
-                    || token_decoration_prefix(suffix, digests))
+                        || noise_stripped_digest_prefix(suffix, restorer)))
+                    || token_decoration_prefix(suffix, restorer))
         })
         .map_or(0, |start| text.len() - start)
 }
@@ -1163,7 +1243,14 @@ fn partial_suffix_len(text: &str, tokens: &HashMap<String, String>, digests: &[S
 /// Lets [`partial_suffix_len`] hold back a digest that a model both split with
 /// formatting and left straddling a chunk boundary. Requires at least one hex
 /// character so a lone `*` or space is never carried.
-fn noise_stripped_digest_prefix(text: &str, digests: &[String]) -> bool {
+fn known_digest_prefix(text: &str, restorer: &Restorer) -> bool {
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return false;
+    }
+    restorer.known_digest_prefix(text)
+}
+
+fn noise_stripped_digest_prefix(text: &str, restorer: &Restorer) -> bool {
     if text.len() > DIGEST_LEN * 4 {
         return false;
     }
@@ -1179,26 +1266,27 @@ fn noise_stripped_digest_prefix(text: &str, digests: &[String]) -> bool {
         }
     }
 
-    !hex.is_empty() && digests.iter().any(|digest| digest.starts_with(&hex))
+    !hex.is_empty() && restorer.known_digest_prefix(&hex)
 }
 
-fn token_decoration_prefix(text: &str, digests: &[String]) -> bool {
+fn token_decoration_prefix(text: &str, restorer: &Restorer) -> bool {
     let text = text.strip_prefix('[').unwrap_or(text);
     if text.is_empty() {
         return true;
     }
+    let normalized = text.to_ascii_uppercase();
 
     TOKEN_DECORATION_LABELS.iter().any(|label| {
-        if label.starts_with(text) {
+        if label.starts_with(&normalized) {
             return true;
         }
-        let Some(suffix) = text
+        let Some(suffix) = normalized
             .strip_prefix(label)
             .and_then(|text| text.strip_prefix(['_', ':', '-']))
         else {
             return false;
         };
-        suffix.is_empty() || digests.iter().any(|digest| digest.starts_with(suffix))
+        suffix.is_empty() || restorer.known_digest_prefix(suffix)
     })
 }
 
@@ -2001,8 +2089,8 @@ mod tests {
         assert_eq!(seen.get(&digest, now), None, "served a colliding digest");
     }
 
-    /// A digest nothing has touched for the idle window is not served, and is
-    /// dropped once the cache next needs room.
+    /// A digest nothing has touched for the idle window is not served and is
+    /// removed by either lookup or later cache activity.
     #[test]
     fn idle_entries_expire() {
         let detector = Detector::default();
@@ -2021,6 +2109,26 @@ mod tests {
             "kept expired plaintext"
         );
         assert_eq!(seen.bytes, 0, "kept expired bytes accounted");
+    }
+
+    #[test]
+    fn later_insert_removes_expired_entries_below_capacity() {
+        let detector = Detector::default();
+        let stale = detector.token(Kind::Custom, "forgotten");
+        let fresh = detector.token(Kind::Custom, "fresh");
+        let stale_digest = token_digest(&stale).expect("token carries a digest");
+        let fresh_digest = token_digest(&fresh).expect("token carries a digest");
+        let now = Instant::now();
+        let later = now + SEEN_IDLE_TTL + Duration::from_secs(1);
+
+        let mut seen = detector.seen();
+        seen.insert(stale_digest.clone(), "stale", now);
+        seen.insert(fresh_digest.clone(), "fresh", later);
+
+        assert!(!seen.entries.contains_key(&stale_digest));
+        assert_eq!(seen.get(&fresh_digest, later), Some("fresh"));
+        assert_eq!(seen.entries.len(), 1);
+        assert_eq!(seen.bytes, entry_bytes(&fresh_digest, Some("fresh")));
     }
 
     /// Cache recall seeds every digest form that `Restorer` accepts, not only the
@@ -2134,6 +2242,105 @@ mod tests {
 
         assert_eq!(restore("0123456789ab", &mappings), "0123456789ab");
         assert_eq!(restore("[EMAIL_0123456789ab]", &mappings), "first");
+    }
+
+    #[test]
+    fn live_restorer_uses_process_global_store_without_copying_it() {
+        let detector = Arc::new(Detector::default());
+        let token = detector.token(Kind::Email, "known");
+        detector.remember(&HashMap::from([(token.clone(), "value".to_owned())]));
+        let digest = token_digest(&token).expect("token carries a digest");
+        let restorer = detector.restorer();
+
+        assert_eq!(restorer.restore(&format!("[email_{digest}]")), "value");
+    }
+
+    #[test]
+    fn live_restorer_prefers_request_mapping_over_global_store() {
+        let detector = Arc::new(Detector::default());
+        let token = detector.token(Kind::Email, "known");
+        detector.remember(&HashMap::from([(token.clone(), "stale".to_owned())]));
+        let mappings = HashMap::from([(token.clone(), "fresh".to_owned())]);
+
+        assert_eq!(
+            detector.restorer().with_mappings(&mappings).restore(&token),
+            "fresh"
+        );
+    }
+
+    #[test]
+    fn live_restorer_carries_one_to_three_known_bare_digest_characters() {
+        let detector = Arc::new(Detector::default());
+        let token = detector.token(Kind::Email, "known");
+        detector.remember(&HashMap::from([(token.clone(), "value".to_owned())]));
+        let digest = token_digest(&token).expect("token carries a digest");
+        let restorer = detector.restorer();
+
+        for split in 1..=3 {
+            let mut carry = RestoreCarry::default();
+            assert_eq!(restorer.restore_fragment(&digest[..split], &mut carry), "");
+            assert_eq!(
+                restorer.restore_fragment(&digest[split..], &mut carry),
+                "value"
+            );
+        }
+    }
+
+    #[test]
+    fn live_restorer_handles_lowercase_and_mixed_case_decorations() {
+        let detector = Arc::new(Detector::default());
+        let token = detector.token(Kind::Email, "known");
+        detector.remember(&HashMap::from([(token.clone(), "value".to_owned())]));
+        let digest = token_digest(&token).expect("token carries a digest");
+        let restorer = detector.restorer();
+
+        for decorated in [
+            format!("[email_{digest}]"),
+            format!("Contact:{digest}"),
+            format!("reDActed-{digest}"),
+        ] {
+            assert_eq!(restorer.restore(&decorated), "value", "{decorated}");
+        }
+    }
+
+    #[test]
+    fn known_formatted_placeholder_is_not_detected_as_fresh_pii() {
+        let detector = Detector::default();
+        let token = detector.token(Kind::Email, "known");
+        detector.remember(&HashMap::from([(token.clone(), "value".to_owned())]));
+        let digest = token_digest(&token).expect("token carries a digest");
+        let echoed = format!("password: [email_{digest}]");
+
+        assert!(detector.scan(&echoed).is_empty());
+    }
+
+    #[test]
+    fn restored_original_is_not_rescanned_by_live_restorer() {
+        let detector = Arc::new(Detector::default());
+        let first = detector.token(Kind::Email, "first");
+        let second = detector.token(Kind::Name, "second");
+        let second_digest = token_digest(&second).expect("token carries a digest");
+        detector.remember(&HashMap::from([
+            (first.clone(), format!("original-{second_digest}")),
+            (second, "wrong".to_owned()),
+        ]));
+
+        assert_eq!(
+            detector.restorer().restore(&first),
+            format!("original-{second_digest}")
+        );
+    }
+
+    #[test]
+    fn deterministic_eviction_keeps_exactly_half_of_tied_entries() {
+        let mut seen = Seen::default();
+        let now = Instant::now();
+        for index in 0..SEEN_CAPACITY {
+            seen.insert(format!("{index:012x}"), "value", now);
+        }
+        seen.insert("ffffffffffff".to_owned(), "new", now);
+
+        assert_eq!(seen.entries.len(), SEEN_CAPACITY / 2 + 1);
     }
 
     #[test]

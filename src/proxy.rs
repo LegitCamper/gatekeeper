@@ -133,13 +133,6 @@ async fn proxy(State(state): State<ProxyState>, request: Request<Body>) -> Respo
         }
     };
 
-    // Mappings start empty for each request and are filled from two sources: the
-    // values this body carries, plus any token it echoes that this process has
-    // tokenized before. The cache is global — Gatekeeper is authless and has no
-    // session identity to scope by — but a digest is a 48-bit keyed hash over a
-    // per-process seed, so a client cannot name a digest for a value it has not
-    // already sent in its own plaintext. Model-invented text is untouched.
-    //
     // Dispatch on the body's *shape*, not its declared content-type. Providers
     // parse a JSON body whatever the header claims, so a client that sends JSON
     // as `text/plain` — or with no content-type at all — would otherwise hand
@@ -150,7 +143,7 @@ async fn proxy(State(state): State<ProxyState>, request: Request<Body>) -> Respo
     // `content-type: application/json` on bodiless requests too, so an absent body
     // must never be judged against a header that only describes bodies.
     let body_is_blank = body.iter().all(u8::is_ascii_whitespace);
-    let (outgoing_body, mappings) = match serde_json::from_slice::<Value>(&body) {
+    let outgoing_body = match serde_json::from_slice::<Value>(&body) {
         Ok(mut value) => {
             // Reads of `.env` and key material must never reach the provider, but
             // the read has already run on the client's machine by the time its
@@ -171,24 +164,11 @@ async fn proxy(State(state): State<ProxyState>, request: Request<Body>) -> Respo
             tracing::debug!(count = mappings.len(), "anonymized request");
             match serde_json::to_vec(&value) {
                 Ok(encoded) => {
-                    // A token the client echoes from an earlier turn only restores
-                    // if this request re-detected the original, and detection is
-                    // context-sensitive — a name that needed a trigger word on one
-                    // turn is bare prose on the next. Recover those mappings from
-                    // the digest cache, and record this request's own so later
-                    // turns can do the same.
+                    // Publish mappings before dispatch. Responses can begin as soon
+                    // as send resolves, and every response uses the process-global
+                    // restorer rather than request-local state.
                     state.detector.remember(&mappings);
-                    let before = mappings.len();
-                    if let Ok(text) = std::str::from_utf8(&encoded) {
-                        state.detector.recall(text, &mut mappings);
-                    }
-                    if mappings.len() > before {
-                        tracing::debug!(
-                            recalled = mappings.len() - before,
-                            "recovered tokens from earlier requests"
-                        );
-                    }
-                    (Bytes::from(encoded), mappings)
+                    Bytes::from(encoded)
                 }
                 Err(error) => {
                     return json_error(
@@ -208,24 +188,9 @@ async fn proxy(State(state): State<ProxyState>, request: Request<Body>) -> Respo
         // `ponytail:` a body that is not JSON at all (binary upload, form post,
         // bare prose) passes through unredacted. Upgrade path: anonymize bodies
         // that are valid UTF-8 text as well, keeping only true binary opaque.
-        //
-        // Recall still runs: a token this process minted can be echoed in a form
-        // post or bare prose just as easily as in JSON, and recovering it needs
-        // only UTF-8 text, not a parse. Nothing here is anonymized, so there is
-        // nothing to remember.
         Err(_) => {
             tracing::debug!("request body is not JSON, skipping anonymization");
-            let mut mappings = HashMap::new();
-            if let Ok(text) = std::str::from_utf8(&body) {
-                state.detector.recall(text, &mut mappings);
-            }
-            if !mappings.is_empty() {
-                tracing::debug!(
-                    recalled = mappings.len(),
-                    "recovered tokens from earlier requests"
-                );
-            }
-            (body, mappings)
+            body
         }
     };
 
@@ -259,14 +224,10 @@ async fn proxy(State(state): State<ProxyState>, request: Request<Body>) -> Respo
         }
     };
 
-    upstream_response(upstream, &state, mappings).await
+    upstream_response(upstream, &state).await
 }
 
-async fn upstream_response(
-    upstream: reqwest::Response,
-    state: &ProxyState,
-    mappings: HashMap<String, String>,
-) -> Response<Body> {
+async fn upstream_response(upstream: reqwest::Response, state: &ProxyState) -> Response<Body> {
     let status = upstream.status();
     let headers = upstream.headers().clone();
     let response_connection_headers = connection_headers(&headers);
@@ -276,13 +237,11 @@ async fn upstream_response(
         tracing::warn!(%status, "forwarding upstream redirect without following it");
     }
 
-    tracing::debug!(
-        "upstream_response: content-type={:?}, mappings={}",
-        response_type,
-        mappings.len()
-    );
+    tracing::debug!("upstream_response: content-type={response_type:?}");
 
-    let restorer = Restorer::new(&mappings);
+    // Build a live process-global restorer after fresh request mappings were
+    // remembered and the upstream responded.
+    let restorer = state.detector.restorer();
     // Gatekeeper asked for `identity`, but an upstream is free to ignore that.
     // Compressed bytes cannot be restored, and re-framing them line by line
     // could corrupt the payload, so hand back exactly what arrived.
@@ -291,13 +250,9 @@ async fn upstream_response(
         .iter()
         .filter_map(|value| value.to_str().ok())
         .any(|value| !value.trim().eq_ignore_ascii_case("identity"));
-    let body = if mappings.is_empty() {
-        // No tokens to restore, pass through as-is
-        Body::from_stream(upstream.bytes_stream())
-    } else if compressed {
+    let body = if compressed {
         tracing::warn!(
             content_type = ?response_type,
-            mappings = mappings.len(),
             "upstream compressed a response despite the identity request; \
              placeholders in it cannot be restored"
         );
@@ -323,16 +278,19 @@ async fn upstream_response(
         };
         match serde_json::from_slice::<Value>(&bytes) {
             Ok(mut value) => {
-                restore_json(&mut value, &restorer);
-                tracing::debug!("restored JSON response");
-                match serde_json::to_vec(&value) {
-                    Ok(value) => Body::from(value),
-                    Err(error) => {
-                        return json_error(
-                            StatusCode::BAD_GATEWAY,
-                            format!("failed to encode upstream response: {error}"),
-                        );
+                if restore_json(&mut value, &restorer) {
+                    tracing::debug!("restored JSON response");
+                    match serde_json::to_vec(&value) {
+                        Ok(value) => Body::from(value),
+                        Err(error) => {
+                            return json_error(
+                                StatusCode::BAD_GATEWAY,
+                                format!("failed to encode upstream response: {error}"),
+                            );
+                        }
                     }
+                } else {
+                    Body::from(bytes)
                 }
             }
             Err(error) => match std::str::from_utf8(&bytes) {
@@ -342,7 +300,6 @@ async fn upstream_response(
                         %status,
                         content_type = ?response_type,
                         bytes = bytes.len(),
-                        mappings = mappings.len(),
                         "upstream response claims JSON but does not parse; restoring as text"
                     );
                     Body::from(restorer.restore(text))
@@ -359,7 +316,11 @@ async fn upstream_response(
         .as_deref()
         .is_some_and(|kind| is_event_stream(kind) || is_ndjson(kind))
     {
-        Body::from_stream(restored_lines(upstream.bytes_stream(), restorer))
+        Body::from_stream(restored_lines_limited(
+            upstream.bytes_stream(),
+            restorer,
+            state.max_body_bytes,
+        ))
     } else {
         // For any other content-type, restore tokens in the text stream.
         tracing::debug!(
@@ -399,42 +360,169 @@ fn anonymize_json_body(
     Ok((Bytes::from(serde_json::to_vec(&value)?), mappings))
 }
 
+const STRINGIFIED_JSON_DEPTH: usize = 16;
+
 fn anonymize_json(value: &mut Value, detector: &Detector, mappings: &mut HashMap<String, String>) {
+    anonymize_json_at_depth(value, detector, mappings, 0);
+}
+
+fn anonymize_json_at_depth(
+    value: &mut Value,
+    detector: &Detector,
+    mappings: &mut HashMap<String, String>,
+    depth: usize,
+) {
     match value {
-        Value::String(text) => {
-            let anonymized = detector.anonymize(text);
-            *text = anonymized.text;
-            mappings.extend(anonymized.mappings);
-        }
+        Value::String(text) => anonymize_string(text, detector, mappings, depth),
         Value::Array(values) => {
             for value in values {
-                anonymize_json(value, detector, mappings);
+                anonymize_json_at_depth(value, detector, mappings, depth);
             }
         }
         Value::Object(values) => {
-            for value in values.values_mut() {
-                anonymize_json(value, detector, mappings);
+            let original = std::mem::take(values);
+            for (key, mut value) in original {
+                anonymize_json_at_depth(&mut value, detector, mappings, depth);
+                let original_key = key.clone();
+                let mut anonymized_key = key;
+                anonymize_string(&mut anonymized_key, detector, mappings, depth);
+                if values.contains_key(&anonymized_key)
+                    && let Some((start, token, digest)) = token_in(&anonymized_key)
+                    && let Some(original) = mappings.get(token).cloned()
+                {
+                    let alias =
+                        unused_digest_alias(values, &anonymized_key, start, token.len(), digest);
+                    mappings.insert(alias.1.clone(), original);
+                    if anonymized_key != original_key {
+                        anonymized_key = alias.0;
+                    } else if let Some(previous) = values.remove(&anonymized_key) {
+                        values.insert(alias.0, previous);
+                    }
+                }
+                values.insert(anonymized_key, value);
             }
         }
         Value::Null | Value::Bool(_) | Value::Number(_) => {}
     }
 }
 
-fn restore_json(value: &mut Value, restorer: &Restorer) {
+fn anonymize_string(
+    text: &mut String,
+    detector: &Detector,
+    mappings: &mut HashMap<String, String>,
+    depth: usize,
+) {
+    let anonymized = detector.anonymize(text);
+    *text = anonymized.text;
+    mappings.extend(anonymized.mappings);
+
+    if depth >= STRINGIFIED_JSON_DEPTH {
+        return;
+    }
+    let Ok(mut nested @ (Value::Array(_) | Value::Object(_))) = serde_json::from_str::<Value>(text)
+    else {
+        return;
+    };
+    let before = nested.clone();
+    anonymize_json_at_depth(&mut nested, detector, mappings, depth + 1);
+    if nested != before
+        && let Ok(encoded) = serde_json::to_string(&nested)
+    {
+        *text = encoded;
+    }
+}
+
+fn token_in(text: &str) -> Option<(usize, &str, &str)> {
+    let bytes = text.as_bytes();
+    for (start, byte) in bytes.iter().enumerate() {
+        if *byte != b'[' {
+            continue;
+        }
+        let Some(relative_end) = text[start..].find(']') else {
+            continue;
+        };
+        let end = start + relative_end + 1;
+        let token = &text[start..end];
+        let Some((_, digest_with_bracket)) = token.rsplit_once('_') else {
+            continue;
+        };
+        let Some(digest) = digest_with_bracket.strip_suffix(']') else {
+            continue;
+        };
+        if digest.len() == 12 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Some((start, token, digest));
+        }
+    }
+    None
+}
+
+fn unused_digest_alias(
+    values: &serde_json::Map<String, Value>,
+    key: &str,
+    token_start: usize,
+    token_len: usize,
+    digest: &str,
+) -> (String, String) {
+    let candidate = |label: &str| {
+        let token = format!("[{label}_{digest}]");
+        let mut key = key.to_owned();
+        key.replace_range(token_start..token_start + token_len, &token);
+        (key, token)
+    };
+    for label in [
+        "REDACTED",
+        "ANONYMIZED",
+        "PRIVATE",
+        "SENSITIVE",
+        "HIDDEN",
+        "MASKED",
+        "SECRET",
+    ] {
+        let alias = candidate(label);
+        if !values.contains_key(&alias.0) {
+            return alias;
+        }
+    }
+
+    // Accepted decoration labels contain uppercase letters and underscores, so
+    // this remains restorable without extending detector grammar.
+    let mut suffix = String::new();
+    loop {
+        suffix.push('A');
+        let alias = candidate(&format!("GK{suffix}"));
+        if !values.contains_key(&alias.0) {
+            return alias;
+        }
+    }
+}
+
+fn restore_json(value: &mut Value, restorer: &Restorer) -> bool {
     match value {
-        Value::String(text) => *text = restorer.restore(text),
-        Value::Array(values) => {
-            for value in values {
-                restore_json(value, restorer);
+        Value::String(text) => {
+            let restored = restorer.restore(text);
+            if restored == *text {
+                false
+            } else {
+                *text = restored;
+                true
             }
+        }
+        Value::Array(values) => {
+            let mut changed = false;
+            for value in values {
+                changed |= restore_json(value, restorer);
+            }
+            changed
         }
         Value::Object(values) => {
+            let mut changed = false;
             for value in values.values_mut() {
-                restore_json(value, restorer);
+                changed |= restore_json(value, restorer);
             }
-            restore_object_keys(values, restorer);
+            changed |= restore_object_keys(values, restorer);
+            changed
         }
-        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
     }
 }
 
@@ -469,36 +557,139 @@ fn restore_object_keys(values: &mut serde_json::Map<String, Value>, restorer: &R
 /// `fields` carries one per JSON field path, because an event body is its own
 /// JSON document and the fragment has to rejoin the *same* field of the next
 /// event rather than whichever string happens to come first.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum PathSegment {
+    Key(String),
+    ArrayIndex(usize),
+    Discriminator { key: String, value: String },
+}
+
+type StreamPath = Vec<PathSegment>;
+
 #[derive(Default)]
 struct StreamCarry {
     text: RestoreCarry,
-    fields: HashMap<String, RestoreCarry>,
+    fields: HashMap<StreamPath, RestoreCarry>,
 }
 
+impl StreamCarry {
+    fn has_unresolved_fields(&self) -> bool {
+        self.fields.values().any(|carry| !carry.text.is_empty())
+    }
+}
+
+#[cfg(test)]
 fn restored_lines(
     source: impl Stream<Item = Result<Bytes, reqwest::Error>>,
     restorer: Restorer,
+) -> impl Stream<Item = Result<Bytes, reqwest::Error>> {
+    restored_lines_limited(source, restorer, usize::MAX)
+}
+
+#[derive(Default)]
+struct SpeculativeLines {
+    raw: Vec<Bytes>,
+    restored: Vec<Bytes>,
+    bytes: usize,
+}
+
+impl SpeculativeLines {
+    fn push(&mut self, raw: Bytes, restored: Bytes) {
+        self.bytes = self.bytes.saturating_add(raw.len());
+        self.raw.push(raw);
+        self.restored.push(restored);
+    }
+
+    fn take_restored(&mut self) -> Vec<Bytes> {
+        self.raw.clear();
+        self.bytes = 0;
+        std::mem::take(&mut self.restored)
+    }
+
+    fn take_safe(&mut self, restorer: &Restorer) -> Vec<Bytes> {
+        self.restored.clear();
+        self.bytes = 0;
+        std::mem::take(&mut self.raw)
+            .into_iter()
+            .map(|line| {
+                let text =
+                    std::str::from_utf8(&line).expect("buffered line was validated as UTF-8");
+                Bytes::from(restore_stream_line_complete(text, restorer))
+            })
+            .collect()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.raw.is_empty()
+    }
+}
+
+fn restored_lines_limited(
+    source: impl Stream<Item = Result<Bytes, reqwest::Error>>,
+    restorer: Restorer,
+    max_pending_bytes: usize,
 ) -> impl Stream<Item = Result<Bytes, reqwest::Error>> {
     try_stream! {
         futures_util::pin_mut!(source);
         let mut carry = BytesMut::new();
         let mut pending = StreamCarry::default();
+        let mut speculative = SpeculativeLines::default();
+        let mut buffering_fields = false;
         while let Some(chunk) = source.next().await {
-            carry.extend_from_slice(&chunk?);
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    for buffered in speculative.take_safe(&restorer) {
+                        yield buffered;
+                    }
+                    Err(error)?;
+                    unreachable!();
+                }
+            };
+            carry.extend_from_slice(&chunk);
             while let Some(newline) = carry.iter().position(|byte| *byte == b'\n') {
                 let line_end = newline + 1;
                 let line = &carry[..line_end];
                 match std::str::from_utf8(line) {
                     Ok(_) => {
-                        let line = carry.split_to(line_end);
-                        let line = std::str::from_utf8(&line).expect("validated UTF-8 line");
-                        yield Bytes::from(restore_stream_line(line, &mut pending, &restorer));
+                        let line = carry.split_to(line_end).freeze();
+                        let text = std::str::from_utf8(&line).expect("validated UTF-8 line");
+                        let restored = Bytes::from(restore_stream_line(text, &mut pending, &restorer));
+                        if !buffering_fields && !pending.has_unresolved_fields() {
+                            yield restored;
+                        } else {
+                            buffering_fields = true;
+                            speculative.push(line, restored);
+                            if !pending.has_unresolved_fields() {
+                                for restored in speculative.take_restored() {
+                                    yield restored;
+                                }
+                                buffering_fields = false;
+                            } else if speculative.bytes > max_pending_bytes {
+                                for buffered in speculative.take_safe(&restorer) {
+                                    yield buffered;
+                                }
+                                pending.fields.clear();
+                                buffering_fields = false;
+                            }
+                        }
                     }
                     Err(error) if error.error_len().is_none() => break,
                     Err(_) => {
+                        if !speculative.is_empty() {
+                            for buffered in speculative.take_safe(&restorer) {
+                                yield buffered;
+                            }
+                            pending.fields.clear();
+                        }
                         yield carry.split_to(line_end).freeze();
                     }
                 }
+            }
+        }
+        if !speculative.is_empty() {
+            for buffered in speculative.take_safe(&restorer) {
+                yield buffered;
             }
         }
         if !carry.is_empty() {
@@ -506,17 +697,78 @@ fn restored_lines(
                 Ok(_) => {
                     let line = carry.split().freeze();
                     let line = std::str::from_utf8(&line).expect("validated UTF-8 tail");
-                    yield Bytes::from(restore_stream_line(line, &mut pending, &restorer));
+                    yield Bytes::from(restore_stream_line_complete(line, &restorer));
                 }
                 Err(_) => yield carry.split().freeze(),
             }
         }
-        // A raw fragment can be emitted as-is; one still held inside a JSON
-        // field has nowhere valid to go, so a stream that ends mid-placeholder
-        // drops those few characters rather than breaking the envelope.
         if !pending.text.text.is_empty() {
             yield Bytes::from(std::mem::take(&mut pending.text.text));
         }
+    }
+}
+
+fn restore_stream_line_complete(line: &str, restorer: &Restorer) -> String {
+    let mut pending = StreamCarry::default();
+    let mut restored = restore_stream_line(line, &mut pending, restorer);
+    if pending.fields.is_empty() {
+        return restored;
+    }
+
+    let (content, line_end) = if let Some(content) = line.strip_suffix("\r\n") {
+        (content, "\r\n")
+    } else if let Some(content) = line.strip_suffix('\n') {
+        (content, "\n")
+    } else {
+        (line, "")
+    };
+    let (prefix, payload, carriage_return) = if let Some(payload) = content.strip_prefix("data:") {
+        let separator_len = payload.starts_with(' ') as usize;
+        let (separator, payload) = payload.split_at(separator_len);
+        let carriage_return_len = payload.ends_with('\r') as usize;
+        let (payload, carriage_return) = payload.split_at(payload.len() - carriage_return_len);
+        (format!("data:{separator}"), payload, carriage_return)
+    } else {
+        (String::new(), content, "")
+    };
+    let Ok(mut value) = serde_json::from_str::<Value>(payload) else {
+        return restored;
+    };
+    flush_json_carries(&mut value, &mut Vec::new(), &mut pending);
+    if let Ok(payload) = serde_json::to_string(&value) {
+        restored = format!("{prefix}{payload}{carriage_return}{line_end}");
+    }
+    restored
+}
+
+fn flush_json_carries(value: &mut Value, path: &mut StreamPath, pending: &mut StreamCarry) {
+    match value {
+        Value::String(text) => {
+            if let Some(carry) = pending.fields.remove(path) {
+                text.push_str(&carry.text);
+                if carry.skip_closing_bracket {
+                    text.push(']');
+                }
+            }
+        }
+        Value::Array(values) => {
+            for (index, value) in values.iter_mut().enumerate() {
+                path.push(PathSegment::ArrayIndex(index));
+                flush_json_carries(value, path, pending);
+                path.pop();
+            }
+        }
+        Value::Object(values) => {
+            let discriminators = stream_discriminators(values);
+            path.extend(discriminators.iter().cloned());
+            for (key, value) in values {
+                path.push(PathSegment::Key(key.clone()));
+                flush_json_carries(value, path, pending);
+                path.pop();
+            }
+            path.truncate(path.len() - discriminators.len());
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
     }
 }
 
@@ -571,38 +823,44 @@ fn restore_stream_payload(payload: &str, pending: &mut StreamCarry, restorer: &R
     restore_stream_text(&payload, &mut pending.text, restorer)
 }
 
-/// `Some` only when `payload` is a JSON object or array, so plain `data:` text
-/// and SSE sentinels such as `[DONE]` keep the raw-text path.
+/// `Some` when `payload` is any JSON value. Plain `data:` text and SSE
+/// sentinels such as `[DONE]` keep the raw-text path.
 fn restore_stream_json(
     payload: &str,
     pending: &mut StreamCarry,
     restorer: &Restorer,
 ) -> Option<String> {
-    let trimmed = payload.trim_start();
-    if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
-        return None;
-    }
     let mut value: Value = serde_json::from_str(payload).ok()?;
-    if !(value.is_object() || value.is_array()) {
-        return None;
-    }
 
     // Parsing and reserializing normalizes whitespace, number formatting, and
     // provider key order. Leave untouched event payloads exactly as upstream sent
     // them; replacement values must be JSON-escaped, so serde can only produce a
     // valid payload, never the original bytes.
     let mut changed = false;
-    restore_json_fields(
-        &mut value,
-        &mut String::new(),
-        pending,
-        restorer,
-        &mut changed,
-    );
+    restore_json_fields(&mut value, &mut Vec::new(), pending, restorer, &mut changed);
     if !changed {
         return Some(payload.to_owned());
     }
     serde_json::to_string(&value).ok()
+}
+
+fn stream_discriminators(values: &serde_json::Map<String, Value>) -> Vec<PathSegment> {
+    ["index", "output_index", "content_index"]
+        .into_iter()
+        .filter_map(|key| {
+            values.get(key).and_then(|value| match value {
+                Value::String(value) => Some(PathSegment::Discriminator {
+                    key: key.to_owned(),
+                    value: value.clone(),
+                }),
+                Value::Number(value) => Some(PathSegment::Discriminator {
+                    key: key.to_owned(),
+                    value: value.to_string(),
+                }),
+                _ => None,
+            })
+        })
+        .collect()
 }
 
 /// Restore every string in an event body, keeping a separate partial
@@ -610,14 +868,14 @@ fn restore_stream_json(
 #[allow(clippy::too_many_arguments)]
 fn restore_json_fields(
     value: &mut Value,
-    path: &mut String,
+    path: &mut StreamPath,
     pending: &mut StreamCarry,
     restorer: &Restorer,
     changed: &mut bool,
 ) {
     match value {
         Value::String(text) => {
-            let mut carry = pending.fields.remove(path.as_str()).unwrap_or_default();
+            let mut carry = pending.fields.remove(path).unwrap_or_default();
             if !carry.text.is_empty() || carry.skip_closing_bracket {
                 *changed = true;
             }
@@ -631,35 +889,21 @@ fn restore_json_fields(
         }
         Value::Array(values) => {
             for (index, value) in values.iter_mut().enumerate() {
-                let parent = path.len();
-                path.push('.');
-                path.push_str(&index.to_string());
+                path.push(PathSegment::ArrayIndex(index));
                 restore_json_fields(value, path, pending, restorer, changed);
-                path.truncate(parent);
+                path.pop();
             }
         }
         Value::Object(values) => {
-            // Anthropic can interleave events from parallel content blocks while
-            // reusing the same field path (`.delta.text`). Include the block's
-            // sibling index so a fragment is never stitched into another block.
-            let parent = path.len();
-            for key in ["index", "output_index", "content_index"] {
-                if let Some(Value::Number(index)) = values.get(key) {
-                    path.push('[');
-                    path.push_str(&index.to_string());
-                    path.push(']');
-                    break;
-                }
-            }
+            let discriminators = stream_discriminators(values);
+            path.extend(discriminators.iter().cloned());
             for (key, value) in values.iter_mut() {
-                let path_before_key = path.len();
-                path.push('.');
-                path.push_str(key);
+                path.push(PathSegment::Key(key.clone()));
                 restore_json_fields(value, path, pending, restorer, changed);
-                path.truncate(path_before_key);
+                path.pop();
             }
             *changed |= restore_object_keys(values, restorer);
-            path.truncate(parent);
+            path.truncate(path.len() - discriminators.len());
         }
         Value::Null | Value::Bool(_) | Value::Number(_) => {}
     }
@@ -697,22 +941,56 @@ fn restored_text_stream(
     try_stream! {
         futures_util::pin_mut!(source);
         let mut token_carry = RestoreCarry::default();
+        let mut utf8_carry = BytesMut::new();
         while let Some(chunk) = source.next().await {
-            let bytes = chunk?;
-            match std::str::from_utf8(&bytes) {
-                Ok(text) => {
-                    let restored = restore_stream_text(text, &mut token_carry, &restorer);
-                    yield Bytes::from(restored);
-                }
-                Err(_) => {
-                    // If not valid UTF-8, pass through as-is and skip token restoration
-                    yield bytes;
+            utf8_carry.extend_from_slice(&chunk?);
+            loop {
+                match std::str::from_utf8(&utf8_carry) {
+                    Ok(text) => {
+                        let restored = restore_stream_text(text, &mut token_carry, &restorer);
+                        utf8_carry.clear();
+                        if !restored.is_empty() {
+                            yield Bytes::from(restored);
+                        }
+                        break;
+                    }
+                    Err(error) if error.error_len().is_none() => {
+                        let valid = error.valid_up_to();
+                        if valid > 0 {
+                            let prefix = utf8_carry.split_to(valid);
+                            let text = std::str::from_utf8(&prefix).expect("validated UTF-8 prefix");
+                            let restored = restore_stream_text(text, &mut token_carry, &restorer);
+                            if !restored.is_empty() {
+                                yield Bytes::from(restored);
+                            }
+                        }
+                        break;
+                    }
+                    Err(error) => {
+                        let valid = error.valid_up_to();
+                        if valid > 0 {
+                            let prefix = utf8_carry.split_to(valid);
+                            let text = std::str::from_utf8(&prefix).expect("validated UTF-8 prefix");
+                            let restored = restore_stream_text(text, &mut token_carry, &restorer);
+                            if !restored.is_empty() {
+                                yield Bytes::from(restored);
+                            }
+                        }
+                        if !token_carry.text.is_empty() {
+                            yield Bytes::from(std::mem::take(&mut token_carry.text));
+                            token_carry.skip_closing_bracket = false;
+                        }
+                        let invalid = error.error_len().unwrap_or(1).min(utf8_carry.len());
+                        yield utf8_carry.split_to(invalid).freeze();
+                    }
                 }
             }
         }
-        // Flush any remaining partial token
         if !token_carry.text.is_empty() {
             yield Bytes::from(std::mem::take(&mut token_carry.text));
+        }
+        if !utf8_carry.is_empty() {
+            yield utf8_carry.freeze();
         }
     }
 }
@@ -1025,6 +1303,42 @@ mod tests {
     }
 
     #[test]
+    fn anonymizes_stringified_json_recursively() {
+        let detector = Detector::default();
+        let body = json!({
+            "arguments": json!({"payload": json!({"contact": "Email alice@example.com"}).to_string()}).to_string()
+        });
+        let raw = serde_json::to_vec(&body).expect("serialized body");
+
+        let (anonymized, mappings) = anonymize_json_body(&raw, &detector).expect("anonymized body");
+        let text = String::from_utf8(anonymized.to_vec()).expect("utf-8 body");
+
+        assert!(!text.contains("alice@example.com"));
+        assert_eq!(mappings.len(), 1);
+    }
+
+    #[test]
+    fn anonymizes_colliding_object_keys_without_data_loss() {
+        let detector = Detector::default();
+        let original_key = "Email jane@example.com";
+        let tokenized_key = detector.anonymize(original_key).text;
+        let body = Value::Object(serde_json::Map::from_iter([
+            (tokenized_key, Value::String("literal".to_owned())),
+            (
+                original_key.to_owned(),
+                Value::String("detected".to_owned()),
+            ),
+        ]));
+        let raw = serde_json::to_vec(&body).expect("serialized body");
+
+        let (anonymized, mappings) = anonymize_json_body(&raw, &detector).expect("anonymized body");
+        let value: Value = serde_json::from_slice(&anonymized).expect("valid JSON");
+
+        assert_eq!(value.as_object().expect("object").len(), 2);
+        assert_eq!(mappings.len(), 2);
+    }
+
+    #[test]
     fn restores_tokens_in_json_object_keys_without_losing_collisions() {
         let mappings = HashMap::from([(
             "[EMAIL_0123456789ab]".to_owned(),
@@ -1052,7 +1366,7 @@ mod tests {
         let mut changed = false;
         restore_json_fields(
             &mut streamed,
-            &mut String::new(),
+            &mut Vec::new(),
             &mut StreamCarry::default(),
             &restorer,
             &mut changed,
