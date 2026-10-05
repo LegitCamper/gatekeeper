@@ -433,6 +433,40 @@ async fn serve(app: Router) -> String {
     format!("http://{address}")
 }
 
+/// Captures placeholders crossing the real upstream wire. First request teaches
+/// the fixture `T1`; second replays `T1`; third records and echoes wrapped `T2`.
+async fn strict_wrap(
+    State(seen): State<Arc<std::sync::Mutex<Vec<String>>>>,
+    request: Request,
+) -> Response {
+    let bytes = to_bytes(request.into_body(), usize::MAX)
+        .await
+        .expect("upstream read the request body");
+    let text = String::from_utf8_lossy(&bytes);
+    let found = token_pattern()
+        .find(&text)
+        .map(|token| token.as_str().to_owned());
+    let mut seen = seen.lock().expect("strict-wrap mutex");
+    let response = match (seen.first(), found) {
+        (None, Some(token)) => {
+            seen.push(token);
+            String::new()
+        }
+        (Some(token), None) => token.clone(),
+        (Some(_), Some(token)) => {
+            seen.push(token.clone());
+            token
+        }
+        (None, None) => String::new(),
+    };
+
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({ "content": response }).to_string(),
+    )
+        .into_response()
+}
+
 /// Replays the placeholder learned from the first request. Later requests need
 /// carry no token or PII, matching a model that recalls an earlier turn.
 async fn replay(
@@ -563,8 +597,13 @@ async fn spawn_redirect_upstream() -> (String, Arc<AtomicUsize>) {
 }
 
 async fn spawn_upstream() -> String {
+    spawn_upstream_with_wrapped_state().await.0
+}
+
+async fn spawn_upstream_with_wrapped_state() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
     let replayed = Arc::new(std::sync::Mutex::new(None));
-    serve(
+    let wrapped = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let address = serve(
         Router::new()
             .route("/v1/messages", post(echo))
             .route("/v1/stream", post(stream))
@@ -579,11 +618,16 @@ async fn spawn_upstream() -> String {
             .route("/v1/malformed", post(malformed_json))
             .route("/v1/empty", post(empty_json))
             .route("/v1/binary", post(binary_json))
+            .route(
+                "/v1/strict-wrap",
+                post(strict_wrap).with_state(Arc::clone(&wrapped)),
+            )
             .route("/v1/replay", post(replay))
             .route("/v1/replay-stream", post(replay_stream))
             .with_state(replayed),
     )
-    .await
+    .await;
+    (address, wrapped)
 }
 
 async fn spawn_gatekeeper(target: &str) -> String {
@@ -739,11 +783,10 @@ async fn compressed_bytes_are_forwarded_without_being_mangled() {
     );
 }
 
-/// A later response restores a placeholder minted by an earlier request even
-/// when the second request carries no token or PII. Restoration state belongs
-/// to the process, not to an individual request.
+/// Provider replay of `T1` from an earlier request stays opaque because the
+/// global registry recognizes fingerprints but holds no plaintext mappings.
 #[tokio::test]
-async fn placeholder_from_an_earlier_request_is_restored_process_wide() {
+async fn earlier_json_replay_stays_tokenized() {
     let upstream = spawn_upstream().await;
     let gatekeeper = spawn_gatekeeper(&upstream).await;
 
@@ -767,17 +810,17 @@ async fn placeholder_from_an_earlier_request_is_restored_process_wide() {
         .expect("utf-8 response body");
 
     assert!(
-        body.contains(&email()),
-        "earlier request's value was not restored: {body}"
+        !body.contains(&email()),
+        "earlier request plaintext leaked into replay: {body}"
     );
     assert!(
-        !token_pattern().is_match(&body),
-        "replayed placeholder survived into the client: {body}"
+        token_pattern().is_match(&body),
+        "replayed T1 should remain opaque: {body}"
     );
 }
 
 #[tokio::test]
-async fn earlier_request_placeholder_restores_in_a_later_stream() {
+async fn earlier_sse_replay_stays_tokenized() {
     let upstream = spawn_upstream().await;
     let gatekeeper = spawn_gatekeeper(&upstream).await;
 
@@ -800,14 +843,71 @@ async fn earlier_request_placeholder_restores_in_a_later_stream() {
         .await
         .expect("utf-8 response body");
 
-    assert!(body.contains(&email()), "email was not restored: {body}");
     assert!(
-        !token_pattern().is_match(&body),
-        "replayed placeholder survived into the client: {body}"
+        !body.contains(&email()),
+        "earlier request plaintext leaked into replay: {body}"
+    );
+    assert!(
+        token_pattern().is_match(&body),
+        "replayed T1 should remain opaque: {body}"
     );
     assert!(
         body.ends_with("data: [DONE]\n\n"),
         "stream truncated: {body}"
+    );
+}
+
+#[tokio::test]
+async fn earlier_inbound_token_is_wrapped_and_unwraps_to_itself() {
+    let (upstream, observed) = spawn_upstream_with_wrapped_state().await;
+    let gatekeeper = spawn_gatekeeper(&upstream).await;
+
+    let first: serde_json::Value = client()
+        .post(format!("{gatekeeper}/v1/strict-wrap"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .json(&serde_json::json!({"content": email()}))
+        .send()
+        .await
+        .expect("gatekeeper responded")
+        .json()
+        .await
+        .expect("valid first response");
+    assert_eq!(first["content"], "");
+
+    let replay: serde_json::Value = client()
+        .post(format!("{gatekeeper}/v1/strict-wrap"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .json(&serde_json::json!({"content": "plain"}))
+        .send()
+        .await
+        .expect("gatekeeper responded")
+        .json()
+        .await
+        .expect("valid replay response");
+    let t1 = replay["content"].as_str().expect("T1 string");
+    assert!(token_pattern().is_match(t1));
+
+    let wrapped: serde_json::Value = client()
+        .post(format!("{gatekeeper}/v1/strict-wrap"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .json(&serde_json::json!({"content": t1}))
+        .send()
+        .await
+        .expect("gatekeeper responded")
+        .json()
+        .await
+        .expect("valid wrapped response");
+    assert_eq!(wrapped["content"], t1);
+    assert_ne!(wrapped["content"], email());
+
+    let observed = observed.lock().expect("strict-wrap mutex");
+    assert_eq!(observed.len(), 2);
+    assert_eq!(observed[0], t1);
+    assert_ne!(observed[1], t1, "upstream received unwrapped T1");
+    assert!(token_pattern().is_match(&observed[1]));
+    assert!(
+        !observed[1].contains(&email()),
+        "upstream received original plaintext"
     );
 }
 

@@ -17,7 +17,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use url::{Position, Url};
 
-use crate::detector::{Detector, RestoreCarry, Restorer};
+use crate::detector::{Detector, RequestRedactions, RestoreCarry, Restorer};
 use crate::toolguard;
 
 #[derive(Clone)]
@@ -96,11 +96,10 @@ async fn scan(State(state): State<ProxyState>, request: Request<Body>) -> Respon
         }
     };
 
-    // `/scan` mints real tokens, so they are remembered like any other: a caller
-    // that scans a value and later sends the token through the proxy gets the
-    // original back, rather than a token that resolves nowhere.
+    // `/scan` mints real tokens, so register their fingerprints without retaining
+    // plaintext in process-global state.
     let anonymized = state.detector.anonymize(&input.text);
-    state.detector.remember(&anonymized.mappings);
+    state.detector.register(&anonymized.mappings);
 
     Json(json!({
         "matches": state.detector.scan(&input.text),
@@ -143,6 +142,7 @@ async fn proxy(State(state): State<ProxyState>, request: Request<Body>) -> Respo
     // `content-type: application/json` on bodiless requests too, so an absent body
     // must never be judged against a header that only describes bodies.
     let body_is_blank = body.iter().all(u8::is_ascii_whitespace);
+    let mut redactions = state.detector.request_redactions();
     let outgoing_body = match serde_json::from_slice::<Value>(&body) {
         Ok(mut value) => {
             // Reads of `.env` and key material must never reach the provider, but
@@ -159,17 +159,10 @@ async fn proxy(State(state): State<ProxyState>, request: Request<Body>) -> Respo
                     "withheld protected file contents from an outbound request"
                 );
             }
-            let mut mappings = HashMap::new();
-            anonymize_json(&mut value, &state.detector, &mut mappings);
-            tracing::debug!(count = mappings.len(), "anonymized request");
+            anonymize_json(&mut value, &mut redactions);
+            tracing::debug!(count = redactions.len(), "anonymized request");
             match serde_json::to_vec(&value) {
-                Ok(encoded) => {
-                    // Publish mappings before dispatch. Responses can begin as soon
-                    // as send resolves, and every response uses the process-global
-                    // restorer rather than request-local state.
-                    state.detector.remember(&mappings);
-                    Bytes::from(encoded)
-                }
+                Ok(encoded) => Bytes::from(encoded),
                 Err(error) => {
                     return json_error(
                         StatusCode::BAD_GATEWAY,
@@ -185,14 +178,17 @@ async fn proxy(State(state): State<ProxyState>, request: Request<Body>) -> Respo
                 format!("invalid JSON request body: {error}"),
             );
         }
-        // `ponytail:` a body that is not JSON at all (binary upload, form post,
-        // bare prose) passes through unredacted. Upgrade path: anonymize bodies
-        // that are valid UTF-8 text as well, keeping only true binary opaque.
-        Err(_) => {
-            tracing::debug!("request body is not JSON, skipping anonymization");
-            body
-        }
+        // Valid UTF-8 non-JSON bodies only wrap tokens minted earlier. Fresh PII
+        // behavior stays unchanged for this documented pass-through path.
+        Err(_) => match std::str::from_utf8(&body) {
+            Ok(text) => Bytes::from(redactions.wrap_known(text)),
+            Err(_) => {
+                tracing::debug!("request body is binary, skipping anonymization");
+                body
+            }
+        },
     };
+    let restorer = redactions.finish();
 
     let mut upstream = state.client.request(method, target);
     for (name, value) in &parts.headers {
@@ -224,10 +220,14 @@ async fn proxy(State(state): State<ProxyState>, request: Request<Body>) -> Respo
         }
     };
 
-    upstream_response(upstream, &state).await
+    upstream_response(upstream, &state, restorer).await
 }
 
-async fn upstream_response(upstream: reqwest::Response, state: &ProxyState) -> Response<Body> {
+async fn upstream_response(
+    upstream: reqwest::Response,
+    state: &ProxyState,
+    restorer: Restorer,
+) -> Response<Body> {
     let status = upstream.status();
     let headers = upstream.headers().clone();
     let response_connection_headers = connection_headers(&headers);
@@ -239,9 +239,6 @@ async fn upstream_response(upstream: reqwest::Response, state: &ProxyState) -> R
 
     tracing::debug!("upstream_response: content-type={response_type:?}");
 
-    // Build a live process-global restorer after fresh request mappings were
-    // remembered and the upstream responded.
-    let restorer = state.detector.restorer();
     // Gatekeeper asked for `identity`, but an upstream is free to ignore that.
     // Compressed bytes cannot be restored, and re-framing them line by line
     // could corrupt the payload, so hand back exactly what arrived.
@@ -250,12 +247,14 @@ async fn upstream_response(upstream: reqwest::Response, state: &ProxyState) -> R
         .iter()
         .filter_map(|value| value.to_str().ok())
         .any(|value| !value.trim().eq_ignore_ascii_case("identity"));
-    let body = if compressed {
-        tracing::warn!(
-            content_type = ?response_type,
-            "upstream compressed a response despite the identity request; \
-             placeholders in it cannot be restored"
-        );
+    let body = if restorer.is_empty() || compressed {
+        if compressed && !restorer.is_empty() {
+            tracing::warn!(
+                content_type = ?response_type,
+                "upstream compressed a response despite the identity request; \
+                 placeholders in it cannot be restored"
+            );
+        }
         Body::from_stream(upstream.bytes_stream())
     } else if response_type.as_deref().is_some_and(is_json) {
         let bytes = match collect_limited(upstream.bytes_stream(), state.max_body_bytes).await {
@@ -352,148 +351,79 @@ async fn upstream_response(upstream: reqwest::Response, state: &ProxyState) -> R
 #[cfg(test)]
 fn anonymize_json_body(
     body: &[u8],
-    detector: &Detector,
-) -> Result<(Bytes, HashMap<String, String>), serde_json::Error> {
+    detector: &Arc<Detector>,
+) -> Result<(Bytes, Restorer), serde_json::Error> {
     let mut value: Value = serde_json::from_slice(body)?;
-    let mut mappings = HashMap::new();
-    anonymize_json(&mut value, detector, &mut mappings);
-    Ok((Bytes::from(serde_json::to_vec(&value)?), mappings))
+    let mut redactions = detector.request_redactions();
+    anonymize_json(&mut value, &mut redactions);
+    Ok((
+        Bytes::from(serde_json::to_vec(&value)?),
+        redactions.finish(),
+    ))
 }
 
 const STRINGIFIED_JSON_DEPTH: usize = 16;
 
-fn anonymize_json(value: &mut Value, detector: &Detector, mappings: &mut HashMap<String, String>) {
-    anonymize_json_at_depth(value, detector, mappings, 0);
+fn anonymize_json(value: &mut Value, redactions: &mut RequestRedactions) {
+    anonymize_json_at_depth(value, redactions, 0);
 }
 
-fn anonymize_json_at_depth(
-    value: &mut Value,
-    detector: &Detector,
-    mappings: &mut HashMap<String, String>,
-    depth: usize,
-) {
+fn anonymize_json_at_depth(value: &mut Value, redactions: &mut RequestRedactions, depth: usize) {
     match value {
-        Value::String(text) => anonymize_string(text, detector, mappings, depth),
+        Value::String(text) => anonymize_string(text, redactions, depth),
         Value::Array(values) => {
             for value in values {
-                anonymize_json_at_depth(value, detector, mappings, depth);
+                anonymize_json_at_depth(value, redactions, depth);
             }
         }
         Value::Object(values) => {
             let original = std::mem::take(values);
             for (key, mut value) in original {
-                anonymize_json_at_depth(&mut value, detector, mappings, depth);
-                let original_key = key.clone();
-                let mut anonymized_key = key;
-                anonymize_string(&mut anonymized_key, detector, mappings, depth);
-                if values.contains_key(&anonymized_key)
-                    && let Some((start, token, digest)) = token_in(&anonymized_key)
-                    && let Some(original) = mappings.get(token).cloned()
-                {
-                    let alias =
-                        unused_digest_alias(values, &anonymized_key, start, token.len(), digest);
-                    mappings.insert(alias.1.clone(), original);
-                    if anonymized_key != original_key {
-                        anonymized_key = alias.0;
-                    } else if let Some(previous) = values.remove(&anonymized_key) {
-                        values.insert(alias.0, previous);
+                anonymize_json_at_depth(&mut value, redactions, depth);
+                let mut attempt = 0_u64;
+                let tokenized_key = loop {
+                    let source = if attempt == 0 {
+                        key.clone()
+                    } else {
+                        format!("{key}{attempt}")
+                    };
+                    let candidate = protect_string(source.clone(), redactions, depth);
+                    if !values.contains_key(&candidate)
+                        && !redactions.would_collide(&candidate, &key)
+                    {
+                        if attempt > 0 {
+                            redactions.alias(candidate.clone(), key.clone());
+                        }
+                        break candidate;
                     }
-                }
-                values.insert(anonymized_key, value);
+                    attempt = attempt.wrapping_add(1);
+                };
+                values.insert(tokenized_key, value);
             }
         }
         Value::Null | Value::Bool(_) | Value::Number(_) => {}
     }
 }
 
-fn anonymize_string(
-    text: &mut String,
-    detector: &Detector,
-    mappings: &mut HashMap<String, String>,
-    depth: usize,
-) {
-    let anonymized = detector.anonymize(text);
-    *text = anonymized.text;
-    mappings.extend(anonymized.mappings);
+fn anonymize_string(text: &mut String, redactions: &mut RequestRedactions, depth: usize) {
+    let original = std::mem::take(text);
+    *text = protect_string(original, redactions, depth);
+}
 
-    if depth >= STRINGIFIED_JSON_DEPTH {
-        return;
-    }
-    let Ok(mut nested @ (Value::Array(_) | Value::Object(_))) = serde_json::from_str::<Value>(text)
-    else {
-        return;
-    };
-    let before = nested.clone();
-    anonymize_json_at_depth(&mut nested, detector, mappings, depth + 1);
-    if nested != before
-        && let Ok(encoded) = serde_json::to_string(&nested)
+fn protect_string(original: String, redactions: &mut RequestRedactions, depth: usize) -> String {
+    if depth < STRINGIFIED_JSON_DEPTH
+        && let Ok(mut nested @ (Value::Array(_) | Value::Object(_))) =
+            serde_json::from_str::<Value>(&original)
     {
-        *text = encoded;
-    }
-}
-
-fn token_in(text: &str) -> Option<(usize, &str, &str)> {
-    let bytes = text.as_bytes();
-    for (start, byte) in bytes.iter().enumerate() {
-        if *byte != b'[' {
-            continue;
-        }
-        let Some(relative_end) = text[start..].find(']') else {
-            continue;
-        };
-        let end = start + relative_end + 1;
-        let token = &text[start..end];
-        let Some((_, digest_with_bracket)) = token.rsplit_once('_') else {
-            continue;
-        };
-        let Some(digest) = digest_with_bracket.strip_suffix(']') else {
-            continue;
-        };
-        if digest.len() == 12 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Some((start, token, digest));
+        let before = nested.clone();
+        anonymize_json_at_depth(&mut nested, redactions, depth + 1);
+        if nested != before
+            && let Ok(encoded) = serde_json::to_string(&nested)
+        {
+            return encoded;
         }
     }
-    None
-}
-
-fn unused_digest_alias(
-    values: &serde_json::Map<String, Value>,
-    key: &str,
-    token_start: usize,
-    token_len: usize,
-    digest: &str,
-) -> (String, String) {
-    let candidate = |label: &str| {
-        let token = format!("[{label}_{digest}]");
-        let mut key = key.to_owned();
-        key.replace_range(token_start..token_start + token_len, &token);
-        (key, token)
-    };
-    for label in [
-        "REDACTED",
-        "ANONYMIZED",
-        "PRIVATE",
-        "SENSITIVE",
-        "HIDDEN",
-        "MASKED",
-        "SECRET",
-    ] {
-        let alias = candidate(label);
-        if !values.contains_key(&alias.0) {
-            return alias;
-        }
-    }
-
-    // Accepted decoration labels contain uppercase letters and underscores, so
-    // this remains restorable without extending detector grammar.
-    let mut suffix = String::new();
-    loop {
-        suffix.push('A');
-        let alias = candidate(&format!("GK{suffix}"));
-        if !values.contains_key(&alias.0) {
-            return alias;
-        }
-    }
+    redactions.protect(&original)
 }
 
 fn restore_json(value: &mut Value, restorer: &Restorer) -> bool {
@@ -1278,7 +1208,7 @@ mod tests {
 
     #[test]
     fn anonymizes_nested_json_strings() {
-        let detector = Detector::default();
+        let detector = Arc::new(Detector::default());
         let body = json!({
             "model": "claude-opus-5",
             "max_tokens": 256,
@@ -1287,7 +1217,7 @@ mod tests {
         });
         let raw = serde_json::to_vec(&body).expect("serialized body");
 
-        let (anonymized, mappings) = anonymize_json_body(&raw, &detector).expect("anonymized body");
+        let (anonymized, restorer) = anonymize_json_body(&raw, &detector).expect("anonymized body");
         let text = String::from_utf8(anonymized.to_vec()).expect("utf-8 body");
 
         assert!(!text.contains("alice@example.com"));
@@ -1295,31 +1225,31 @@ mod tests {
         // Non-string values and non-PII strings pass through untouched.
         assert!(text.contains("\"max_tokens\":256"));
         assert!(text.contains("claude-opus-5"));
-        assert_eq!(mappings.len(), 2);
+        assert_eq!(restorer.len(), 2);
 
         let mut restored: Value = serde_json::from_slice(&anonymized).expect("valid JSON");
-        restore_json(&mut restored, &Restorer::new(&mappings));
+        restore_json(&mut restored, &restorer);
         assert_eq!(restored, body);
     }
 
     #[test]
     fn anonymizes_stringified_json_recursively() {
-        let detector = Detector::default();
+        let detector = Arc::new(Detector::default());
         let body = json!({
             "arguments": json!({"payload": json!({"contact": "Email alice@example.com"}).to_string()}).to_string()
         });
         let raw = serde_json::to_vec(&body).expect("serialized body");
 
-        let (anonymized, mappings) = anonymize_json_body(&raw, &detector).expect("anonymized body");
+        let (anonymized, restorer) = anonymize_json_body(&raw, &detector).expect("anonymized body");
         let text = String::from_utf8(anonymized.to_vec()).expect("utf-8 body");
 
         assert!(!text.contains("alice@example.com"));
-        assert_eq!(mappings.len(), 1);
+        assert_eq!(restorer.len(), 1);
     }
 
     #[test]
     fn anonymizes_colliding_object_keys_without_data_loss() {
-        let detector = Detector::default();
+        let detector = Arc::new(Detector::default());
         let original_key = "Email jane@example.com";
         let tokenized_key = detector.anonymize(original_key).text;
         let body = Value::Object(serde_json::Map::from_iter([
@@ -1331,11 +1261,16 @@ mod tests {
         ]));
         let raw = serde_json::to_vec(&body).expect("serialized body");
 
-        let (anonymized, mappings) = anonymize_json_body(&raw, &detector).expect("anonymized body");
+        let (anonymized, restorer) = anonymize_json_body(&raw, &detector).expect("anonymized body");
         let value: Value = serde_json::from_slice(&anonymized).expect("valid JSON");
+        let text = String::from_utf8(anonymized.to_vec()).expect("UTF-8 JSON");
 
         assert_eq!(value.as_object().expect("object").len(), 2);
-        assert_eq!(mappings.len(), 2);
+        assert!(
+            !text.contains(original_key),
+            "raw key reached upstream: {text}"
+        );
+        assert_eq!(restorer.len(), 2);
     }
 
     #[test]
@@ -1377,7 +1312,7 @@ mod tests {
 
     #[tokio::test]
     async fn restores_sse_token_split_across_events() {
-        let detector = Detector::default();
+        let detector = Arc::new(Detector::default());
         let anonymized = detector.anonymize("mail alice@example.com");
         let token = anonymized
             .mappings
@@ -1554,7 +1489,7 @@ mod tests {
 
     #[tokio::test]
     async fn restores_sse_across_arbitrary_chunk_boundaries() {
-        let detector = Detector::default();
+        let detector = Arc::new(Detector::default());
         let anonymized = detector.anonymize(PROMPT);
         let event = format!("data: {{\"text\":\"{}\"}}\n\n", anonymized.text);
 
@@ -1751,11 +1686,9 @@ mod tests {
         assert!(seen.contains("id_ed25519.pub"), "{seen}");
     }
 
-    /// A token echoed from an earlier turn restores from the digest cache, even
-    /// though this request re-detected nothing. Detection is context-sensitive,
-    /// so the alternative is a raw token surfacing in the client mid-conversation.
+    /// Earlier inbound token is wrapped upstream and unwraps exactly one layer.
     #[tokio::test]
-    async fn token_from_a_previous_request_is_restored() {
+    async fn token_from_a_previous_request_is_wrapped() {
         let target = echo_upstream("application/json").await;
         let state = state(&target);
         let original = "alice@example.com";
@@ -1783,12 +1716,12 @@ mod tests {
             .expect("built request");
         let seen = body_text(app.oneshot(follow_up).await.expect("second response")).await;
 
-        assert!(seen.contains(original), "{seen}");
+        assert!(seen.contains(&token), "{seen}");
+        assert!(!seen.contains(original), "{seen}");
     }
 
-    /// The cache only answers for digests this process minted. A token shaped
-    /// like ours but never issued stays untouched — asserted against a populated
-    /// cache, since an empty one would pass without consulting a digest at all.
+    /// A token shaped like ours but never issued stays untouched — asserted
+    /// against a populated registry, since an empty one would pass trivially.
     #[tokio::test]
     async fn foreign_token_from_another_process_is_not_restored() {
         let target = echo_upstream("application/json").await;
@@ -1821,10 +1754,9 @@ mod tests {
         assert!(seen.contains(FOREIGN), "{seen}");
     }
 
-    /// Recall does not need a JSON parse: a token echoed in a form post or bare
-    /// prose is still a token this process minted.
+    /// Earlier inbound token in non-JSON text unwraps to exact token, not secret.
     #[tokio::test]
-    async fn echoed_token_in_a_non_json_body_is_restored() {
+    async fn echoed_token_in_a_non_json_body_is_wrapped() {
         let target = echo_upstream("text/plain").await;
         let state = state(&target);
         let original = "alice@example.com";
@@ -1852,7 +1784,8 @@ mod tests {
             .expect("built request");
         let seen = body_text(app.oneshot(prose).await.expect("response")).await;
 
-        assert!(seen.contains(original), "{seen}");
+        assert!(seen.contains(&token), "{seen}");
+        assert!(!seen.contains(original), "{seen}");
     }
 
     #[tokio::test]
@@ -1890,7 +1823,7 @@ mod tests {
 
     #[tokio::test]
     async fn streamed_response_restores_only_this_requests_placeholders() {
-        let detector = Detector::default();
+        let detector = Arc::new(Detector::default());
         let anonymized = detector.anonymize("mail alice@example.com");
         let token = anonymized
             .mappings
@@ -1918,7 +1851,7 @@ mod tests {
 
     #[tokio::test]
     async fn restores_placeholder_split_across_ndjson_fields() {
-        let detector = Detector::default();
+        let detector = Arc::new(Detector::default());
         let anonymized = detector.anonymize("mail alice@example.com");
         let token = anonymized
             .mappings

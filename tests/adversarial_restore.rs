@@ -118,6 +118,18 @@ fn mangled_token_forms() {
     assert!(wrong.is_empty(), "restored a corrupted hash: {wrong:?}");
 }
 
+#[test]
+fn chained_mappings_restore_only_one_layer() {
+    let inner = "[EMAIL_0123456789ab]";
+    let outer = "[TOKEN_fedcba987654]";
+    let maps = HashMap::from([
+        (inner.to_owned(), "secret@example.com".to_owned()),
+        (outer.to_owned(), inner.to_owned()),
+    ]);
+
+    assert_eq!(restore(outer, &maps), inner);
+}
+
 /// Multi-token text: does one unrestorable token break its neighbours?
 #[test]
 fn mixed_known_and_unknown_tokens() {

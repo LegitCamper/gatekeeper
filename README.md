@@ -1,6 +1,6 @@
 # Gatekeeper
 
-Gatekeeper is a Rust/Axum reverse proxy that removes sensitive values before LLM API requests reach an upstream provider and restores recognized placeholders in responses while the process cache retains their mappings.
+Gatekeeper is a Rust/Axum reverse proxy that removes sensitive values before LLM API requests reach an upstream provider and restores only mappings created while handling the current request.
 
 ```
    agent / SDK             Gatekeeper :8080            upstream provider
@@ -37,11 +37,10 @@ Gatekeeper is a Rust/Axum reverse proxy that removes sensitive values before LLM
         API_KEY EMAIL CARD SSN IP DOB PHONE ADDRESS NAME
         PATH CUSTOM
         "[EMAIL_a1b2c3d4e5f6]"  <-  a real address, a phone, a name
-        digests are cached process-wide, so a token the client
-          echoes from an earlier turn still restores once the
-          trigger context that first exposed it is gone
-          (dropped 30 min after last use, or under 1 GiB /
-           10k-entry pressure; colliding digests serve nothing)
+        fingerprints are cached process-wide, so a token the client
+          echoes from an earlier turn is recognized and wrapped in a
+          fresh request-local token before it reaches the provider
+          (the registry never stores or restores plaintext)
    6  headers - hop-by-hop dropped, client accept-encoding
       dropped, upstream asked for identity
    7  auth - UPSTREAM_API_KEY replaces the client credential;
@@ -52,10 +51,10 @@ Gatekeeper is a Rust/Axum reverse proxy that removes sensitive values before LLM
  upstream - RESPONSE back:
 
    9  status + headers forwarded; a 3xx handed to the caller
-  10  restore tokens, this request's digests plus any this
-      process has minted before
+  10  restore only this request's mappings
         JSON | SSE | NDJSON | plain text
         token split across chunks -> carried, then stitched
+        earlier tokens recognized inbound -> wrapped, not resolved
         model-invented text and foreign tokens -> left alone
         responses are never scanned for new secrets
   11  no tokens ............ byte-for-byte passthrough
@@ -80,14 +79,14 @@ Gatekeeper is a Rust/Axum reverse proxy that removes sensitive values before LLM
 - Redacts home-directory paths down to the account name: `/home/<user>`, `/var/home/<user>`, and `/Users/<user>` become one `PATH` token, so the username goes and the rest of the path (`/projects/gatekeeper/src`) stays readable for the model and restorable for the client.
 - Redacts whatever you list in `GATEKEEPER_REDACT`, plus optionally this machine's login and host name — see [Custom redaction](#custom-redaction).
 - Withholds the result of outbound tool calls that read `.env`, `.pem`, or `.key` files, so private configuration and key material cannot be handed to a provider — while forwarding the request, so the agent keeps working. Writes and `.env.example` are unaffected. See [`.env` read guard](#env-read-guard).
-- Restores tokens in JSON, Server-Sent Event, and other streamed responses, including tokens split across chunks. Restoration keys on the process-seeded 12-hex digest, so common model changes to token prefixes, brackets, separators, or hex case still restore the original value.
+- Restores tokens in JSON, Server-Sent Event, and other streamed responses, including tokens split across chunks. Restoration resolves only request-local mappings, so common model changes to token prefixes, brackets, separators, or hex case restore only when the digest belongs to that request.
 - Supports Anthropic and OpenAI wire protocols without translating schemas. Every non-local route keeps its incoming path and query when forwarded to the configured upstream base path, apart from the dot-segment collapsing that any conforming URL parser performs. Upstream redirects are returned to the caller instead of followed inside Gatekeeper.
 - Requests that carry no body are forwarded untouched, so provider endpoints that only read — `GET /v1/models`, `/api/tags`, `/api/version` — need no allowance list and see exactly what the caller sent. SDKs put `content-type: application/json` on those calls too, which does not make an absent body malformed. Inspection starts where a body exists.
 - Never requires Redis or another external state service.
 
-Token mappings are process-global, not request- or session-scoped. A later response can therefore restore a token minted by any earlier request handled by the same process, even when the later request carries no token or PII. This is intended for a single trusted user: Gatekeeper is authless and cannot isolate mappings between mutually untrusted clients. The 12-hex digest is a keyed hash using a fresh per-process random seed, so a client cannot derive a useful token from a known value without first seeing that process's token, but that cryptographic property is not tenant isolation.
+Plaintext mappings are request-local and are dropped when the response ends. A process-global registry retains only keyed fingerprints of previously issued tokens, never their original values. When a client sends an earlier token `T1` in a later request, Gatekeeper recognizes its fingerprint and replaces it with a fresh request-local token `T2` upstream. If the provider echoes `T2`, the client receives exactly `T1`, not the secret that originally produced `T1`. If the provider independently replays `T1`, it remains `T1` because no global plaintext mapping exists.
 
-Mappings expire after 30 minutes without a hit. The cache also caps itself at 10,000 entries and 1 GiB of stored originals, evicting the colder half under pressure. A digest collision is poisoned and restores nothing rather than choosing one original. Restarting Gatekeeper rotates the seed and clears every mapping, so placeholders from the old process remain opaque. Run one process per trust boundary; multi-user or multi-tenant deployment needs authenticated session-scoped storage that Gatekeeper does not provide.
+This strict wrapping preserves opaque placeholders across conversation turns without retaining plaintext globally or allowing one request to recover another request's secret. Registry entries expire after 30 minutes without a full-token hit and cap at 10,000 entries, evicting the colder half under pressure. Unknown and colliding fingerprints stay opaque. Restarting Gatekeeper rotates the keyed fingerprint seed and clears the registry. No session header is required.
 
 ## Secret coverage
 
@@ -288,7 +287,7 @@ curl http://127.0.0.1:8080/v1/messages \
   }'
 ```
 
-No session header is required: restoration state is process-global. Use any request ID header when upstream observability needs correlation; it does not scope token restoration.
+No session header is required: strict wrapping carries opaque tokens across turns without global plaintext restoration. Use any request ID header when upstream observability needs correlation; it does not affect token restoration.
 
 ### Provider transparency
 
@@ -296,7 +295,7 @@ Gatekeeper is endpoint- and schema-neutral. Anthropic `/v1/messages`, OpenAI `/v
 
 Request methods, provider headers, response status, response headers, JSON structure, SSE framing, NDJSON records, and stream mode pass without Anthropic/OpenAI schema translation. Gatekeeper does not retry requests or convert a streaming request into a non-streaming one. Upstream redirects are forwarded with their `3xx` status and `Location`; Gatekeeper does not follow them and hide the redirect behind a later response.
 
-Responses are not validated against provider schemas or scanned for new sensitive values. Only recognized placeholders already mapped by this process are restored; a name, number, address, or secret newly introduced by the upstream is never scanned, filtered, or tokenized. A stream event with nothing to restore is forwarded byte for byte, `event:` line, key order, and all; a payload that did receive a value is re-encoded, which can change insignificant whitespace or object-key order without changing its data structure. Provider protocol fields — `type`, `index`, `delta.type`, stop reasons — are never rewritten by restoration. Response status and end-to-end headers remain upstream's; only hop-by-hop headers are removed as HTTP forwarding requires. If a provider or intermediate gateway directly returns valid JSON with HTTP `200` but the wrong provider schema, Gatekeeper forwards it; diagnose that upstream response and its request-ID headers. Malformed JSON that is valid UTF-8 is likewise forwarded with its upstream status after process-global restoration. A fresh non-JSON request body that contains raw PII is passed through unredacted; non-JSON text is inspected only for placeholders this process already minted. Gatekeeper asks upstream for `accept-encoding: identity` so responses arrive as plain text; an upstream that ignores that gets its compressed body forwarded byte for byte with its `Content-Encoding` and a `warn` log, unrestored, because rewriting compressed bytes would corrupt them for the client. Undecodable bytes with no declared encoding cannot be restored at all and produce a Gatekeeper `502`.
+Responses are not validated against provider schemas or scanned for new sensitive values. Only request-local mappings are restored. The process-global registry can recognize an earlier token's keyed fingerprint but holds no plaintext: provider replay of an earlier `T1` remains `T1`, while inbound `T1` is wrapped as a fresh `T2` upstream and an echoed `T2` unwraps to exactly `T1`. A name, number, address, or secret newly introduced by the upstream is never scanned, filtered, or tokenized. A stream event with nothing to restore is forwarded byte for byte, `event:` line, key order, and all; a payload that did receive a value is re-encoded, which can change insignificant whitespace or object-key order without changing its data structure. Provider protocol fields — `type`, `index`, `delta.type`, stop reasons — are never rewritten by restoration. Response status and end-to-end headers remain upstream's; only hop-by-hop headers are removed as HTTP forwarding requires. If a provider or intermediate gateway directly returns valid JSON with HTTP `200` but the wrong provider schema, Gatekeeper forwards it; diagnose that upstream response and its request-ID headers. Malformed JSON that is valid UTF-8 is likewise forwarded with its upstream status after request-local restoration. A fresh non-JSON request body that contains raw PII is passed through unredacted; non-JSON text is inspected only for recognized placeholders that need strict wrapping. Gatekeeper asks upstream for `accept-encoding: identity` so responses arrive as plain text; an upstream that ignores that gets its compressed body forwarded byte for byte with its `Content-Encoding` and a `warn` log, unrestored, because rewriting compressed bytes would corrupt them for the client. Undecodable bytes with no declared encoding cannot be restored at all and produce a Gatekeeper `502`.
 
 ## Local endpoints
 
