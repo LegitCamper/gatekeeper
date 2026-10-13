@@ -95,6 +95,12 @@ const SEEN_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
 static TOKEN_SHAPE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i:\[[a-z_]{2,16}_[0-9a-f]{12}\])").expect("token shape is valid")
 });
+/// RFC 9562 UUIDs are transport identifiers, not phone numbers. Digit-heavy
+/// node fields can otherwise satisfy the bare-phone detector.
+static UUID_SHAPE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})")
+        .expect("UUID shape is valid")
+});
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct Digest([u8; DIGEST_LEN / 2]);
@@ -715,6 +721,10 @@ impl Detector {
             .find_iter(text)
             .map(|token| (token.start(), token.end()))
             .collect();
+        let uuids: Vec<(usize, usize)> = UUID_SHAPE
+            .find_iter(text)
+            .map(|uuid| (uuid.start(), uuid.end()))
+            .collect();
         let now = Instant::now();
         let known: Vec<(usize, usize)> = {
             let seen = self.seen();
@@ -725,10 +735,13 @@ impl Detector {
                 .collect()
         };
         candidates.retain(|candidate| {
-            !canonical
+            !uuids
                 .iter()
-                .chain(&known)
                 .any(|(start, end)| candidate.start >= *start && candidate.end <= *end)
+                && !canonical
+                    .iter()
+                    .chain(&known)
+                    .any(|(start, end)| candidate.start >= *start && candidate.end <= *end)
         });
         resolve(candidates)
     }
@@ -2169,6 +2182,15 @@ mod tests {
             protected.split_whitespace().nth(1)
         );
         assert_eq!(redactions.len(), 1);
+    }
+
+    #[test]
+    fn uuid_like_ids_are_not_redacted_as_phone_numbers() {
+        let detector = Detector::default();
+        let id = "fco_9c4e2a71-6b3d-7f40-a285-4155552671e8";
+
+        assert!(detector.scan(id).is_empty());
+        assert_eq!(detector.anonymize(id).text, id);
     }
 
     #[test]
