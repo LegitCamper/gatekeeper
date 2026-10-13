@@ -364,6 +364,10 @@ fn anonymize_json_body(
 
 const STRINGIFIED_JSON_DEPTH: usize = 16;
 
+fn is_opaque_json_field(key: &str) -> bool {
+    key == "encrypted_content"
+}
+
 fn anonymize_json(value: &mut Value, redactions: &mut RequestRedactions) {
     anonymize_json_at_depth(value, redactions, 0);
 }
@@ -379,7 +383,9 @@ fn anonymize_json_at_depth(value: &mut Value, redactions: &mut RequestRedactions
         Value::Object(values) => {
             let original = std::mem::take(values);
             for (key, mut value) in original {
-                anonymize_json_at_depth(&mut value, redactions, depth);
+                if !is_opaque_json_field(&key) {
+                    anonymize_json_at_depth(&mut value, redactions, depth);
+                }
                 let mut attempt = 0_u64;
                 let tokenized_key = loop {
                     let source = if attempt == 0 {
@@ -1230,6 +1236,28 @@ mod tests {
         let mut restored: Value = serde_json::from_slice(&anonymized).expect("valid JSON");
         restore_json(&mut restored, &restorer);
         assert_eq!(restored, body);
+    }
+
+    #[test]
+    fn preserves_encrypted_reasoning_content_byte_for_byte() {
+        let detector = Arc::new(Detector::default());
+        let encrypted = "gAAAAAB0x-4155552671e8_Xpp";
+        let body = json!({
+            "input": [{
+                "type": "reasoning",
+                "encrypted_content": encrypted,
+                "summary": [],
+            }],
+            "instructions": "Email alice@example.com",
+        });
+        let raw = serde_json::to_vec(&body).expect("serialized body");
+
+        let (anonymized, restorer) = anonymize_json_body(&raw, &detector).expect("anonymized body");
+        let value: Value = serde_json::from_slice(&anonymized).expect("valid JSON");
+
+        assert_eq!(value["input"][0]["encrypted_content"], encrypted);
+        assert_ne!(value["instructions"], body["instructions"]);
+        assert_eq!(restorer.len(), 1);
     }
 
     #[test]
