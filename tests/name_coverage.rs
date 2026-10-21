@@ -14,6 +14,16 @@ fn names(text: &str) -> Vec<String> {
 }
 
 #[test]
+fn gateway_status_does_not_identify_technical_terms_as_names() {
+    let text = "Added /readyz DNS probe and Fly checks to skip unhealthy DoH instances. \
+                DoT remains TCP-only. Crashes restart; failed health checks don't.\n\n\
+                Tests, Clippy, HTTP smoke checks, Fly config validation pass.\n\n\
+                Not deployed. Publish updated serverless image before fly deploy. \
+                Run two Machines for failover.";
+    assert!(names(text).is_empty(), "false names: {:?}", names(text));
+}
+
+#[test]
 fn explicit_person_context_covers_reported_names() {
     for (text, expected) in [
         ("patient María José García called", "María José García"),

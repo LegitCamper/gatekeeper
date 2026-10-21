@@ -645,12 +645,6 @@ fn restored_lines_limited(
 }
 
 fn restore_stream_line_complete(line: &str, restorer: &Restorer) -> String {
-    let mut pending = StreamCarry::default();
-    let mut restored = restore_stream_line(line, &mut pending, restorer);
-    if pending.fields.is_empty() {
-        return restored;
-    }
-
     let (content, line_end) = if let Some(content) = line.strip_suffix("\r\n") {
         (content, "\r\n")
     } else if let Some(content) = line.strip_suffix('\n') {
@@ -668,44 +662,15 @@ fn restore_stream_line_complete(line: &str, restorer: &Restorer) -> String {
         (String::new(), content, "")
     };
     let Ok(mut value) = serde_json::from_str::<Value>(payload) else {
-        return restored;
+        return restore_stream_line(line, &mut StreamCarry::default(), restorer);
     };
-    flush_json_carries(&mut value, &mut Vec::new(), &mut pending);
-    if let Ok(payload) = serde_json::to_string(&value) {
-        restored = format!("{prefix}{payload}{carriage_return}{line_end}");
+    // Fallback starts from the original event; partial suffixes are already there.
+    if !restore_json(&mut value, restorer) {
+        return line.to_owned();
     }
-    restored
-}
-
-fn flush_json_carries(value: &mut Value, path: &mut StreamPath, pending: &mut StreamCarry) {
-    match value {
-        Value::String(text) => {
-            if let Some(carry) = pending.fields.remove(path) {
-                text.push_str(&carry.text);
-                if carry.skip_closing_bracket {
-                    text.push(']');
-                }
-            }
-        }
-        Value::Array(values) => {
-            for (index, value) in values.iter_mut().enumerate() {
-                path.push(PathSegment::ArrayIndex(index));
-                flush_json_carries(value, path, pending);
-                path.pop();
-            }
-        }
-        Value::Object(values) => {
-            let discriminators = stream_discriminators(values);
-            path.extend(discriminators.iter().cloned());
-            for (key, value) in values {
-                path.push(PathSegment::Key(key.clone()));
-                flush_json_carries(value, path, pending);
-                path.pop();
-            }
-            path.truncate(path.len() - discriminators.len());
-        }
-        Value::Null | Value::Bool(_) | Value::Number(_) => {}
-    }
+    serde_json::to_string(&value)
+        .map(|payload| format!("{prefix}{payload}{carriage_return}{line_end}"))
+        .unwrap_or_else(|_| line.to_owned())
 }
 
 fn restore_stream_line(line: &str, pending: &mut StreamCarry, restorer: &Restorer) -> String {
@@ -1422,6 +1387,48 @@ mod tests {
         }
 
         assert_eq!(content, "USADONESTATUS_OK");
+    }
+
+    #[tokio::test]
+    async fn stream_fallback_preserves_text_and_restores_complete_tokens() {
+        let mappings = HashMap::from([(
+            "[EMAIL_0123456789ab]".to_owned(),
+            "alice@example.com".to_owned(),
+        )]);
+        // An unfinished field keeps other events buffered until EOF or the limit.
+        let events = [
+            json!({"other": "["}),
+            json!({"delta": "Do"}),
+            json!({"delta": "H, Do"}),
+            json!({"delta": "T. Cr"}),
+            json!({"delta": "ashes restart."}),
+            json!({"delta": "[EMAIL_0123456789ab]", "tail": "Do"}),
+            json!({"delta": "[EMAIL_0123456789ab"}),
+            json!({"delta": "[EMAIL_0123"}),
+        ];
+        let mut expected = events.to_vec();
+        expected[5]["delta"] = json!("alice@example.com");
+        expected[6]["delta"] = json!("alice@example.com");
+
+        for limit in [usize::MAX, 0] {
+            let source = futures_util::stream::iter(
+                events
+                    .iter()
+                    .map(|event| Ok(Bytes::from(format!("data: {event}\r\n\r\n")))),
+            );
+            let stream = restored_lines_limited(source, Restorer::new(&mappings), limit);
+            futures_util::pin_mut!(stream);
+            let mut output = String::new();
+            while let Some(chunk) = stream.next().await {
+                output.push_str(std::str::from_utf8(&chunk.expect("chunk")).expect("UTF-8"));
+            }
+            let actual: Vec<Value> = output
+                .split("\r\n")
+                .filter_map(|line| line.strip_prefix("data: "))
+                .map(|payload| serde_json::from_str(payload).expect("JSON event"))
+                .collect();
+            assert_eq!(actual, expected, "pending byte limit: {limit}");
+        }
     }
 
     /// A digest a model split with formatting can also land across a chunk
