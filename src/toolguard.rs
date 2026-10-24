@@ -260,7 +260,8 @@ fn collect_invocations<'a>(value: &'a Value, out: &mut Vec<&'a Map<String, Value
 }
 
 /// The keys that carry a tool's arguments across the provider schemas.
-const ARGUMENT_KEYS: [&str; 7] = [
+const ARGUMENT_KEYS: [&str; 8] = [
+    "action",
     "input",
     "arguments",
     "parameters",
@@ -350,9 +351,9 @@ fn is_write_tool(map: &Map<String, Value>) -> bool {
 /// OpenAI chat completions on a `tool_calls` entry, and the Responses API
 /// `call_id` on a `function_call` item.
 fn invocation_id(map: &Map<String, Value>) -> Option<&str> {
-    map.get("id")
+    map.get("call_id")
         .and_then(Value::as_str)
-        .or_else(|| map.get("call_id").and_then(Value::as_str))
+        .or_else(|| map.get("id").and_then(Value::as_str))
 }
 
 fn blank_results(
@@ -369,19 +370,33 @@ fn blank_results(
         }
         Value::Object(map) => {
             if let Some((id, label)) = answering_result(map, calls) {
+                let notice = format!(
+                    "[gatekeeper withheld the contents of {label}. Do not retry the \
+                     read or reach for another tool: this proxy never forwards them \
+                     to the model provider. Ask the user for the value you need.]"
+                );
+                let shell = map.get("type").and_then(Value::as_str) == Some("shell_call_output");
                 let mut payload = false;
                 // Blank every key that could carry the file, so a body using both
                 // spellings cannot leak through the one that was not expected.
                 for key in ["content", "output"] {
+                    if shell
+                        && key == "output"
+                        && let Some(Value::Array(results)) = map.get_mut(key)
+                    {
+                        for result in results {
+                            if let Value::Object(result) = result {
+                                result.insert("stdout".into(), Value::String(notice.clone()));
+                                result.insert("stderr".into(), Value::String(String::new()));
+                            } else {
+                                *result = Value::String(notice.clone());
+                            }
+                        }
+                        payload = true;
+                        continue;
+                    }
                     if map.contains_key(key) {
-                        map.insert(
-                            key.to_owned(),
-                            Value::String(format!(
-                                "[gatekeeper withheld the contents of {label}. Do not retry the \
-                                 read or reach for another tool: this proxy never forwards them \
-                                 to the model provider. Ask the user for the value you need.]"
-                            )),
-                        );
+                        map.insert(key.to_owned(), Value::String(notice.clone()));
                         payload = true;
                     }
                 }
@@ -406,7 +421,7 @@ fn blank_results(
 fn answering_result(map: &Map<String, Value>, calls: &[ReadCall]) -> Option<(String, String)> {
     let is_result = matches!(
         map.get("type"),
-        Some(Value::String(kind)) if kind == "tool_result" || kind == "function_call_output"
+        Some(Value::String(kind)) if matches!(kind.as_str(), "tool_result" | "function_call_output" | "custom_tool_call_output" | "shell_call_output" | "mcp_call")
     ) || matches!(
         map.get("role"),
         Some(Value::String(role)) if role == "tool"
@@ -414,7 +429,7 @@ fn answering_result(map: &Map<String, Value>, calls: &[ReadCall]) -> Option<(Str
     if !is_result {
         return None;
     }
-    let id = ["tool_use_id", "call_id", "tool_call_id"]
+    let id = ["tool_use_id", "call_id", "tool_call_id", "id"]
         .iter()
         .filter_map(|key| map.get(*key).and_then(Value::as_str))
         .next()?;
@@ -430,7 +445,7 @@ fn answering_result(map: &Map<String, Value>, calls: &[ReadCall]) -> Option<(Str
 fn is_invocation(map: &Map<String, Value>) -> bool {
     let typed = matches!(
         map.get("type"),
-        Some(Value::String(kind)) if kind == "tool_use" || kind == "tool_call"
+        Some(Value::String(kind)) if matches!(kind.as_str(), "tool_use" | "tool_call" | "shell_call")
     );
     let named_call = map.contains_key("name")
         && ["input", "arguments", "parameters", "command"]

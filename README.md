@@ -24,16 +24,19 @@ Gatekeeper is a Rust/Axum reverse proxy that removes sensitive values before LLM
       (GET /v1/models, /api/tags, DELETE: no allowlist,
        no rewriting - SDKs send a JSON content-type on
        these too, and an absent body is not malformed)
-   3  JSON parse
-        ok ..................... step 4
+   3  upgrade: websocket ........ WebSocket bridge (below)
+   4  JSON parse
+        ok ..................... step 5
         claims JSON, broken .... 400
-        not JSON (binary, form, prose) ... passthrough, step 8
-   4  tool guard - WITHHOLD, never refuse
+        multipart/form-data .... text + JSON/NDJSON parts scanned,
+          binary parts preserved, malformed part 400
+        not JSON (binary, form, prose) ... passthrough, step 9
+   5  tool guard - WITHHOLD, never refuse
         read of .env / *.pem / *.key ... result replaced by
           a "ask the user" notice, the call still forwarded
         cp .env /tmp/x ... legitimate, but the copy is tracked:
           a later read of that path is blanked too
-   5  detector - PII + secrets -> tokens
+   6  detector - PII + secrets -> tokens
         API_KEY EMAIL CARD SSN IP DOB PHONE ADDRESS NAME
         PATH CUSTOM
         "[EMAIL_a1b2c3d4e5f6]"  <-  a real address, a phone, a name
@@ -41,23 +44,24 @@ Gatekeeper is a Rust/Axum reverse proxy that removes sensitive values before LLM
           echoes from an earlier turn is recognized and wrapped in a
           fresh request-local token before it reaches the provider
           (the registry never stores or restores plaintext)
-   6  headers - hop-by-hop dropped, client accept-encoding
+   7  headers - hop-by-hop dropped, client accept-encoding
       dropped, upstream asked for identity
-   7  auth - UPSTREAM_API_KEY replaces the client credential;
+   8  auth - UPSTREAM_API_KEY replaces the client credential;
       unset, the client's own header is forwarded
-   8  same path + query onto TARGET_URL - no schema
+   9  same path + query onto TARGET_URL - no schema
       translation, no retries, redirects not followed
 
  upstream - RESPONSE back:
 
-   9  status + headers forwarded; a 3xx handed to the caller
-  10  restore only this request's mappings
-        JSON | SSE | NDJSON | plain text
+  10  status + headers forwarded; a 3xx handed to the caller
+  11  restore only this request's mappings
+        JSON | SSE | NDJSON | plain text | WebSocket frames
         token split across chunks -> carried, then stitched
         earlier tokens recognized inbound -> wrapped, not resolved
         model-invented text and foreign tokens -> left alone
         responses are never scanned for new secrets
-  11  no tokens ............ byte-for-byte passthrough
+  12  no tokens ............ byte-for-byte passthrough
+      binary content-type .. byte-for-byte passthrough
       upstream compressed .. warn, bytes handed back as-is
       undecodable body ..... 502
 
@@ -74,6 +78,7 @@ Gatekeeper is a Rust/Axum reverse proxy that removes sensitive values before LLM
 
 - Detects and tokenizes common PII and secrets in JSON request strings and object keys, including recursively encoded JSON objects and arrays inside string values. See [Secret coverage](#secret-coverage) for the key and credential formats recognized.
 - Preserves `encrypted_content` JSON fields byte for byte. Responses API reasoning items use these as opaque replay values, so scanning or rewriting them would invalidate the ciphertext.
+- Preserves base64 media in image URLs, file data URLs, Anthropic base64 sources, Gemini inline data, and OpenAI input audio, including tool results and stringified JSON. Text beside these payloads is still redacted. Encoded media is forwarded unchanged; Gatekeeper does not inspect its decoded contents or perform OCR.
 - Handles bare 10- and 11-digit, leading-`+`, dashed/dotted/parenthesized, international, and Vietnamese phone formats. Placeholder numbers such as `000-000-0000` are redacted too, so an undialable number in a prompt is still removed.
 - Detects person names through two routes. In ordinary text, a ~19k-entry multi-origin given-name dictionary requires a following capitalized surname; a bare first name is intentionally insufficient. Explicit identity contexts (`my name is`, `name:`, `Mr.`, `Mrs.`, `Ms.`, `Dr.`) accept one to three words, while general person contexts (`attn`, `cc`, `contact`, `patient`, `regards`, `signed`, `sincerely`) accept multi-word names outside the dictionary. Contextual pairs may be lowercase or all caps. Unicode letters, hyphenated names, and common surname particles are supported. Selected common-word, calendar, direction, geographic, and known-phrase deny lists reduce false positives such as "New York", "Redis Cluster", and "Docker Compose"; they do not guarantee that every ambiguous English name is excluded.
 - Redacts outbound requests only. Response text is never scanned, so a name, number, or address the model invents reaches the client exactly as written.
@@ -298,6 +303,22 @@ Request methods, provider headers, response status, response headers, JSON struc
 
 Responses are not validated against provider schemas or scanned for new sensitive values. Only request-local mappings are restored. The process-global registry can recognize an earlier token's keyed fingerprint but holds no plaintext: provider replay of an earlier `T1` remains `T1`, while inbound `T1` is wrapped as a fresh `T2` upstream and an echoed `T2` unwraps to exactly `T1`. A name, number, address, or secret newly introduced by the upstream is never scanned, filtered, or tokenized. A stream event with nothing to restore is forwarded byte for byte, `event:` line, key order, and all; a payload that did receive a value is re-encoded, which can change insignificant whitespace or object-key order without changing its data structure. Provider protocol fields — `type`, `index`, `delta.type`, stop reasons — are never rewritten by restoration. Response status and end-to-end headers remain upstream's; only hop-by-hop headers are removed as HTTP forwarding requires. If a provider or intermediate gateway directly returns valid JSON with HTTP `200` but the wrong provider schema, Gatekeeper forwards it; diagnose that upstream response and its request-ID headers. Malformed JSON that is valid UTF-8 is likewise forwarded with its upstream status after request-local restoration. A fresh non-JSON request body that contains raw PII is passed through unredacted; non-JSON text is inspected only for recognized placeholders that need strict wrapping. Gatekeeper asks upstream for `accept-encoding: identity` so responses arrive as plain text; an upstream that ignores that gets its compressed body forwarded byte for byte with its `Content-Encoding` and a `warn` log, unrestored, because rewriting compressed bytes would corrupt them for the client. Undecodable bytes with no declared encoding cannot be restored at all and produce a Gatekeeper `502`.
 
+### Multipart uploads
+
+`multipart/form-data` bodies are walked part by part instead of being passed through whole. Text parts and parts whose content type or filename marks them as JSON, JSONL, or NDJSON (`.json`, `.jsonl`, `.ndjson`, text suffixes) are redacted with the same detector and tool guard as a JSON body; every other part — images, audio, archives — is forwarded byte for byte. Part headers, names, filenames, and boundary order are preserved, and the reassembled body uses the incoming boundary.
+
+A part Gatekeeper cannot read is refused before it reaches upstream, with a `400` and a `gateway_error`: a malformed boundary, a part with no name, or a `content-transfer-encoding` that would hide text from the detector. Passing those through would mean forwarding unscanned bytes, which is the one failure mode redaction cannot tolerate.
+
+### WebSockets
+
+An incoming request carrying `upgrade: websocket` is bridged to the same path and query on `TARGET_URL`, with `http`/`https` mapped to `ws`/`wss`. Gatekeeper performs the upstream handshake first, so the client's connection is only accepted once upstream agrees; the negotiated `sec-websocket-protocol` is echoed back to the client, and `UPSTREAM_API_KEY` replaces the client credential on the handshake exactly as it does for HTTP. A handshake the upstream rejects comes back as that status with a `gateway_error` body and upstream's own headers (`x-request-id` and friends) intact.
+
+Each `response.create` message opens a turn with its own restorer, so a value redacted in one turn is never restored into another. Turns are tracked per lane: an optional top-level `stream_id` (1–256 characters of `[A-Za-z0-9_.-]`) keeps parallel conversations on one socket independent, is treated as routing metadata rather than model text, and is stripped before the message reaches the detector and re-attached after. Messages with no `stream_id` share the default lane and are answered in order.
+
+Inbound frames are restored per turn with the same stream carry as SSE, so a token split across two deltas is held and stitched. JSON arriving in a binary frame is inspected and sent back as a binary frame; non-JSON binary frames pass through untouched. `ping` is answered in both directions, and a close from either side is propagated with its code and reason after any text still held for stitching is flushed, so no partial token is lost on shutdown.
+
+Limits mirror the HTTP path. `GATEKEEPER_MAX_BODY_BYTES` caps frame and message size, total queued request bytes, and buffered restoration bytes; at most 64 turns may be in flight. Exceeding a limit, sending non-JSON text, or sending an invalid `stream_id` returns a `gateway_error` event on the socket instead of dropping the connection. A PII-bearing message that is not `response.create` is refused the same way: there is no response identity to scope its mappings to, so it cannot be restored safely.
+
 ## Local endpoints
 
 - `GET /health` and `GET /healthz` return `{"status":"ok"}`.
@@ -325,6 +346,20 @@ cargo test --all-targets --all-features --locked
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo bench --bench detector
 ```
+
+### Live provider matrix
+
+`tests/live_compatibility.py` runs an endpoint/tool/image matrix against a real gateway, directly and through a local Gatekeeper, and labels every row `PASS`, `UPSTREAM_QUIRK`, `UPSTREAM_FAILURE`, or `PROXY_FAILURE` so a provider bug is never read as a proxy bug. Stdlib only, no provider URLs or model IDs baked in, and the key is redacted from its output.
+
+```bash
+GATEKEEPER_TEST_UPSTREAM=https://gateway.example \
+GATEKEEPER_TEST_API_KEY=your-key \
+GATEKEEPER_TEST_MODELS=vendor/model-a,vendor/model-b \
+python3 tests/live_compatibility.py --protocol responses --protocol chat --checks tool,image,structured
+```
+
+`GATEKEEPER_TEST_AUTH_HEADER` picks the credential header (include a `Bearer ` prefix in the key when the gateway wants one), `GATEKEEPER_TEST_PROXY` points at an already-running Gatekeeper instead of spawning one, and `--self-test` exercises the harness against a local fixture server with no network at all. The WebSocket equivalent is `cargo test --test websocket -- --ignored` with `GATEKEEPER_TEST_UPSTREAM` and `GATEKEEPER_TEST_MODELS` set; an HTTP-only gateway answers the upgrade with `404`/`405`/`501` and those rows are skipped rather than failed.
+
 
 ## Inspiration
 

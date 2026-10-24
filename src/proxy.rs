@@ -20,6 +20,9 @@ use url::{Position, Url};
 use crate::detector::{Detector, RequestRedactions, RestoreCarry, Restorer};
 use crate::toolguard;
 
+mod multipart;
+mod websocket;
+
 #[derive(Clone)]
 pub struct ProxyState {
     target_url: Url,
@@ -109,6 +112,13 @@ async fn scan(State(state): State<ProxyState>, request: Request<Body>) -> Respon
 }
 
 async fn proxy(State(state): State<ProxyState>, request: Request<Body>) -> Response<Body> {
+    if request
+        .headers()
+        .get(header::UPGRADE)
+        .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"websocket"))
+    {
+        return websocket::proxy(state, request).await;
+    }
     let content_type = content_type(request.headers()).map(str::to_owned);
     let connection_headers = connection_headers(request.headers());
     let method = request.method().clone();
@@ -143,50 +153,55 @@ async fn proxy(State(state): State<ProxyState>, request: Request<Body>) -> Respo
     // must never be judged against a header that only describes bodies.
     let body_is_blank = body.iter().all(u8::is_ascii_whitespace);
     let mut redactions = state.detector.request_redactions();
-    let outgoing_body = match serde_json::from_slice::<Value>(&body) {
-        Ok(mut value) => {
-            // Reads of `.env` and key material must never reach the provider, but
-            // the read has already run on the client's machine by the time its
-            // contents ride back outbound — refusing the request stops the agent
-            // without un-reading the file, and since clients resend history every
-            // turn it would stop that session forever. Withhold the payload and
-            // forward, so the guard holds and the agent keeps working.
-            let withheld = toolguard::withhold_protected_reads(&mut value);
-            if !withheld.blanked.is_empty() || !withheld.unpaired.is_empty() {
-                tracing::warn!(
-                    blanked = ?withheld.blanked,
-                    unpaired = ?withheld.unpaired,
-                    "withheld protected file contents from an outbound request"
-                );
-            }
-            anonymize_json(&mut value, &mut redactions);
-            tracing::debug!(count = redactions.len(), "anonymized request");
-            match serde_json::to_vec(&value) {
-                Ok(encoded) => Bytes::from(encoded),
-                Err(error) => {
-                    return json_error(
-                        StatusCode::BAD_GATEWAY,
-                        format!("failed to encode anonymized request: {error}"),
-                    );
+    let outgoing_body = if content_type
+        .as_deref()
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("multipart/form-data"))
+    {
+        let full_type = parts.headers[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap_or_default();
+        match multipart::anonymize(body, full_type, &mut redactions).await {
+            Ok(body) => body,
+            Err(reason) => return json_error(StatusCode::BAD_REQUEST, reason),
+        }
+    } else {
+        match serde_json::from_slice::<Value>(&body) {
+            Ok(mut value) => {
+                // Reads of `.env` and key material must never reach the provider, but
+                // the read has already run on the client's machine by the time its
+                // contents ride back outbound — refusing the request stops the agent
+                // without un-reading the file, and since clients resend history every
+                // turn it would stop that session forever. Withhold the payload and
+                // forward, so the guard holds and the agent keeps working.
+                anonymize_request_value(&mut value, &mut redactions);
+                tracing::debug!(count = redactions.len(), "anonymized request");
+                match serde_json::to_vec(&value) {
+                    Ok(encoded) => Bytes::from(encoded),
+                    Err(error) => {
+                        return json_error(
+                            StatusCode::BAD_GATEWAY,
+                            format!("failed to encode anonymized request: {error}"),
+                        );
+                    }
                 }
             }
-        }
-        // A body that claims to be JSON but is not stays a client error.
-        Err(error) if !body_is_blank && content_type.as_deref().is_some_and(is_json) => {
-            return json_error(
-                StatusCode::BAD_REQUEST,
-                format!("invalid JSON request body: {error}"),
-            );
-        }
-        // Valid UTF-8 non-JSON bodies only wrap tokens minted earlier. Fresh PII
-        // behavior stays unchanged for this documented pass-through path.
-        Err(_) => match std::str::from_utf8(&body) {
-            Ok(text) => Bytes::from(redactions.wrap_known(text)),
-            Err(_) => {
-                tracing::debug!("request body is binary, skipping anonymization");
-                body
+            // A body that claims to be JSON but is not stays a client error.
+            Err(error) if !body_is_blank && content_type.as_deref().is_some_and(is_json) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid JSON request body: {error}"),
+                );
             }
-        },
+            // Valid UTF-8 non-JSON bodies only wrap tokens minted earlier. Fresh PII
+            // behavior stays unchanged for this documented pass-through path.
+            Err(_) => match std::str::from_utf8(&body) {
+                Ok(text) => Bytes::from(redactions.wrap_known(text)),
+                Err(_) => {
+                    tracing::debug!("request body is binary, skipping anonymization");
+                    body
+                }
+            },
+        }
     };
     let restorer = redactions.finish();
 
@@ -247,7 +262,20 @@ async fn upstream_response(
         .iter()
         .filter_map(|value| value.to_str().ok())
         .any(|value| !value.trim().eq_ignore_ascii_case("identity"));
-    let body = if restorer.is_empty() || compressed {
+    let binary = response_type.as_deref().is_some_and(|kind| {
+        let kind = kind.to_ascii_lowercase();
+        kind.starts_with("audio/")
+            || kind.starts_with("image/")
+            || kind.starts_with("video/")
+            || matches!(
+                kind.as_str(),
+                "application/octet-stream"
+                    | "application/pdf"
+                    | "application/zip"
+                    | "application/gzip"
+            )
+    });
+    let body = if restorer.is_empty() || compressed || binary {
         if compressed && !restorer.is_empty() {
             tracing::warn!(
                 content_type = ?response_type,
@@ -364,8 +392,31 @@ fn anonymize_json_body(
 
 const STRINGIFIED_JSON_DEPTH: usize = 16;
 
-fn is_opaque_json_field(key: &str) -> bool {
+fn anonymize_request_value(value: &mut Value, redactions: &mut RequestRedactions) {
+    let withheld = toolguard::withhold_protected_reads(value);
+    if !withheld.blanked.is_empty() || !withheld.unpaired.is_empty() {
+        tracing::warn!(
+            blanked = ?withheld.blanked,
+            unpaired = ?withheld.unpaired,
+            "withheld protected file contents from an outbound request"
+        );
+    }
+    anonymize_json(value, redactions);
+}
+
+fn is_opaque_json_field(key: &str, value: &Value, base64_data: bool) -> bool {
     key == "encrypted_content"
+        || (key == "images"
+            && value
+                .as_array()
+                .is_some_and(|images| images.iter().all(Value::is_string)))
+        || (key == "data" && base64_data && value.is_string())
+        || (matches!(key, "image_url" | "url" | "file_data")
+            && value.as_str().is_some_and(|text| {
+                text.strip_prefix("data:")
+                    .and_then(|data| data.split_once(','))
+                    .is_some_and(|(metadata, _)| metadata.ends_with(";base64"))
+            }))
 }
 
 fn anonymize_json(value: &mut Value, redactions: &mut RequestRedactions) {
@@ -381,9 +432,17 @@ fn anonymize_json_at_depth(value: &mut Value, redactions: &mut RequestRedactions
             }
         }
         Value::Object(values) => {
+            // Encoded media is opaque; digit runs inside it are not phone numbers.
+            let base64_data = values.get("type").and_then(Value::as_str) == Some("base64")
+                || values.get("mimeType").is_some_and(Value::is_string)
+                || values.get("mime_type").is_some_and(Value::is_string)
+                || matches!(
+                    values.get("format").and_then(Value::as_str),
+                    Some("wav" | "mp3")
+                );
             let original = std::mem::take(values);
             for (key, mut value) in original {
-                if !is_opaque_json_field(&key) {
+                if !is_opaque_json_field(&key, &value, base64_data) {
                     anonymize_json_at_depth(&mut value, redactions, depth);
                 }
                 let mut attempt = 0_u64;
@@ -428,6 +487,8 @@ fn protect_string(original: String, redactions: &mut RequestRedactions, depth: u
         {
             return encoded;
         }
+        // Do not scan serialized JSON again: that would rewrite opaque fields.
+        return original;
     }
     redactions.protect(&original)
 }
@@ -799,6 +860,31 @@ fn restore_json_fields(
             let discriminators = stream_discriminators(values);
             path.extend(discriminators.iter().cloned());
             for (key, value) in values.iter_mut() {
+                // ponytail: metadata restores per event; split identifier tokens
+                // need their own buffer. "lookup_contact" must not stall arguments.
+                if value.is_string()
+                    && matches!(
+                        key.as_str(),
+                        "id" | "type"
+                            | "object"
+                            | "model"
+                            | "role"
+                            | "name"
+                            | "stream_id"
+                            | "call_id"
+                            | "tool_call_id"
+                            | "tool_use_id"
+                            | "item_id"
+                            | "event_id"
+                            | "previous_response_id"
+                            | "finish_reason"
+                            | "stop_reason"
+                            | "stop_sequence"
+                    )
+                {
+                    *changed |= restore_json(value, restorer);
+                    continue;
+                }
                 path.push(PathSegment::Key(key.clone()));
                 restore_json_fields(value, path, pending, restorer, changed);
                 path.pop();
@@ -1226,6 +1312,45 @@ mod tests {
     }
 
     #[test]
+    fn preserves_encoded_media_and_redacts_neighboring_text() {
+        let detector = Arc::new(Detector::default());
+        let data = "AAAA/4155552671/AAAAAAAA";
+        let image = format!("data:image/png;base64,{data}");
+        let media = json!([
+            {"type": "function_call_output", "call_id": "call_image", "output": [
+                {"type": "input_image", "image_url": image}
+            ]},
+            {"type": "image_url", "image_url": {"url": image}},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": data}},
+            {"type": "input_audio", "input_audio": {"format": "wav", "data": data}},
+            {"type": "input_file", "file_data": format!("data:application/pdf;base64,{data}")},
+            {"inlineData": {"mimeType": "image/png", "data": data}},
+            {"inline_data": {"mime_type": "image/png", "data": data}},
+            {"type": "reasoning", "encrypted_content": "gAAAAAB0x-4155552671e8_Xpp"}
+        ]);
+        for encoded in [false, true] {
+            let body = json!({
+                "input": if encoded { Value::String(media.to_string()) } else { media.clone() },
+                "text": "Email alice@example.com",
+                "data": "Phone 4155552671",
+                "image_url": "https://example.com/alice@example.com",
+                "source": {"type": "text", "data": "Phone 4155552671"},
+                "malformed_source": {"type": "base64", "data": {"text": "Email alice@example.com"}},
+            });
+            let (bytes, restorer) =
+                anonymize_json_body(&serde_json::to_vec(&body).unwrap(), &detector).unwrap();
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["input"], body["input"], "encoded={encoded}");
+            for key in ["text", "data", "image_url", "source", "malformed_source"] {
+                assert_ne!(value[key], body[key], "{key}: encoded={encoded}");
+            }
+            let mut restored = value;
+            restore_json(&mut restored, &restorer);
+            assert_eq!(restored, body);
+        }
+    }
+
+    #[test]
     fn anonymizes_stringified_json_recursively() {
         let detector = Arc::new(Detector::default());
         let body = json!({
@@ -1429,6 +1554,63 @@ mod tests {
                 .collect();
             assert_eq!(actual, expected, "pending byte limit: {limit}");
         }
+    }
+
+    #[tokio::test]
+    async fn streamed_tool_metadata_does_not_block_argument_restoration() {
+        let mappings = HashMap::from([(
+            "[EMAIL_0123456789ab]".to_owned(),
+            "alice@example.com".to_owned(),
+        )]);
+        let mut events = vec![json!({
+            "id": "chatcmpl-contact", "model": "model-email", "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": {"tool_calls": [{
+                "index": 0, "id": "call_contact", "type": "function",
+                "function": {"name": "lookup_contact", "arguments": ""}
+            }]}}]
+        })];
+        for fragment in [
+            "{\"email\":\"",
+            "[",
+            "EMAIL",
+            "_0123",
+            "456789ab",
+            "]",
+            "\"}",
+        ] {
+            events.push(json!({"choices": [{"index": 0, "delta": {"tool_calls": [{
+                "index": 0, "function": {"arguments": fragment}
+            }]}}]}));
+        }
+        let source = futures_util::stream::iter(
+            events
+                .iter()
+                .map(|event| Ok(Bytes::from(format!("data: {event}\n\n")))),
+        );
+        let stream = restored_lines(source, Restorer::new(&mappings));
+        futures_util::pin_mut!(stream);
+        let mut output = String::new();
+        while let Some(chunk) = stream.next().await {
+            output.push_str(std::str::from_utf8(&chunk.unwrap()).unwrap());
+        }
+        let actual: Vec<Value> = output
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|payload| serde_json::from_str(payload).unwrap())
+            .collect();
+        assert_eq!(actual[0], events[0]);
+        let arguments: String = actual
+            .iter()
+            .map(|event| {
+                event["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
+                    .as_str()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            serde_json::from_str::<Value>(&arguments).unwrap(),
+            json!({"email": "alice@example.com"})
+        );
     }
 
     /// A digest a model split with formatting can also land across a chunk

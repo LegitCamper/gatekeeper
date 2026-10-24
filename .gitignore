@@ -1,3 +1,4 @@
 /target
 .env
 coverage/
+__pycache__/
