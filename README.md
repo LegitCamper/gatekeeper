@@ -1,6 +1,58 @@
 # Gatekeeper
 
-Gatekeeper is a Rust/Axum reverse proxy that removes sensitive values before LLM API requests reach an upstream provider and restores only mappings created while handling the current request.
+Gatekeeper is a Rust/Axum reverse proxy that removes sensitive values before LLM API requests reach an upstream provider. By default, restoration is request-local. Optional plaintext SQLite storage restores mappings across requests and restarts, scoped to an authenticated owner's conversation. The Compose setup enables this durable mode.
+
+## Durable conversation storage
+
+Set `GATEKEEPER_DB_PATH` and `GATEKEEPER_CLIENT_TOKEN` to enable persistence. No encryption key is required. Without a database path, the request-local behavior described below remains unchanged.
+
+Each gateway instance serves one configured `GATEKEEPER_OWNER_ID` (default `local`) authenticated by its client token. Every proxied request must supply `x-gatekeeper-token` and a stable conversation ID in `x-gatekeeper-conversation-id`, `thread-id`, or `thread_id`. IDs accept 1-256 ASCII letters, digits, dots, underscores, or hyphens and are case-sensitive. If multiple identity headers or repeated values are present, they must all match exactly; none overrides another. Missing, invalid, or conflicting IDs stop the request before upstream forwarding. Both Gatekeeper headers are stripped before forwarding upstream; provider authorization headers retain their existing behavior.
+
+The client must save the ID with its conversation and send it again when reopening that conversation, including after a gateway restart. Use an existing stable thread ID, or generate an ID once when creating the conversation and persist it in client metadata. Use different IDs for independent conversations; a single static header for every chat combines their mappings. Gatekeeper does not infer identity from message text, IP addresses, API keys, request IDs, session IDs, or connection IDs, and does not mint a new ID when one is missing. A client that cannot send a stable per-conversation header needs an adapter before using durable mode. Switching between supported header names preserves identity when the value is unchanged.
+
+Storage uses values, conversations, and bindings tables, plus one metadata row holding a randomly generated identifier seed. Identical original bytes are stored once per owner as plaintext; conversations reference the same value using different placeholders. Repeated use in one conversation reuses its binding. A full HMAC-SHA256 fingerprint deduplicates values; the database seed keeps fingerprints and scoped placeholders stable across restarts without an external key. Collision checks fail rather than overwrite. The seed is not encryption and is not an at-rest security boundary. Missing seed metadata fails startup rather than silently replacing it.
+
+**Database readers can see original values and their conversation associations.** Neither a conversation ID nor a placeholder is authentication; the client token authorizes access to this owner's conversations. Upstream AI API access is not a substitute for gateway authentication. Restrict filesystem and backup access even though storage intentionally remains plaintext.
+
+SQLite uses WAL, foreign keys, and `synchronous=FULL`. Mappings commit before a request reaches the provider; storage errors stop forwarding. The plaintext hot cache has a 1 MiB accounting budget; eviction never deletes disk mappings. Each request loads a bounded conversation snapshot (at most 10,000 bindings and `GATEKEEPER_MAX_BODY_BYTES` of accounted mapping data). Exceeding either limit fails closed rather than silently dropping old mappings. Concurrent active requests hold their own snapshots in addition to the shared cache.
+
+**Durable mode buffers each complete HTTP response or WebSocket turn before releasing it.** JSON, SSE, NDJSON, text, and JSON WebSocket messages retain their protocol framing, but tokens no longer stream to the client as they arrive. Unresolved canonical placeholders, malformed JSON/stream data, incomplete SSE/WebSocket turns, unsupported binary/compressed HTTP responses, oversized output, or strings encoded beyond four JSON parsing levels produce a gateway error. This guard recognizes canonical placeholder syntax, not arbitrary model-invented variants or bare unknown digests. Opaque reasoning and media fields are never rewritten by restoration; the guard still checks serialized text for canonical placeholders so a field name cannot bypass validation. Encoded media is not decoded or scanned for PII. Legacy mode keeps its existing streaming and pass-through behavior.
+
+WebSocket authentication and the conversation ID are fixed at handshake. Each named `stream_id` gets a stable, separate storage scope; the unnamed lane uses the handshake conversation ID. Use separate conversations for independent work. Control events without a response identity cannot introduce redacted values. Durable sockets require JSON messages; non-JSON binary messages are rejected. Deleting a handshake conversation also removes its named lane scopes.
+
+Delete one conversation's mappings with `DELETE /gatekeeper/conversation`, supplying the same authentication and conversation headers. Values shared with other conversations remain; unreferenced values are removed. Deletion affects future loads, not snapshots already held by in-flight requests, so stop active work first. Logical deletion is not forensic erasure of WAL files, snapshots, or backups. `/health` and `/healthz` remain public; `/scan` requires client authentication in durable mode and remains a request-local diagnostic, not a durable token minting API.
+
+Back up the complete database, including its identifier seed, using SQLite's backup API or after stopping the gateway; do not copy only the main file while WAL writes are active. Losing the database loses restoration. Changing the owner ID changes the namespace. Client tokens can rotate without changing stored mappings. Use TLS or a trusted local connection for the client token; Compose binds the gateway to loopback by default. This is a single-owner gateway, not a multi-user authentication service. The earlier experimental encrypted schema (v1) is rejected without rewriting its contents; migration is not automatic. Preserve that database and its old key if it contains mappings you still need.
+
+Old request-local tokens that have already lost their originals cannot be migrated automatically. Start a fresh conversation and reread the original files when moving an affected conversation to durable mode. Saving fingerprints alone would not recover those values.
+
+### Compose setup
+
+Create a private `.env` file, or add the client token to your existing file without overwriting its other settings:
+
+```bash
+umask 077
+touch .env
+chmod 600 .env
+openssl rand -hex 32  # copy into GATEKEEPER_CLIENT_TOKEN
+docker compose -f compose.yml up -d --build
+```
+
+Compose keeps `mappings.sqlite3`, its WAL, and shared-memory file together in the `gatekeeper_data` named volume, writable by the nonroot container user. Normal container replacement preserves mappings. `docker compose down -v` deletes that volume and its mappings. SQLite is bundled into the binary; no database service is required. Retain the volume after upgrades and restarts. A missing client token makes Compose fail configuration rather than run with insecure defaults.
+
+Configure your client's HTTP headers with the client token and a stable conversation ID; never place credentials in the prompt. For a manual test, with the token exported in your shell:
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "x-gatekeeper-token: $GATEKEEPER_CLIENT_TOKEN" \
+  -H 'x-gatekeeper-conversation-id: example-thread' \
+  -H 'content-type: application/json' \
+  --data '{"model":"your-model","messages":[{"role":"user","content":"Hello"}]}'
+```
+
+To run locally with persistence, create a private data directory, set `GATEKEEPER_DB_PATH` to its database filename, and export the storage key and client token before starting Gatekeeper. The process does not load `.env` automatically.
+
+## Request-local mode
 
 ```
    agent / SDK             Gatekeeper :8080            upstream provider
@@ -258,7 +310,7 @@ export UPSTREAM_API_KEY=your-9router-endpoint-key
 cargo run --release
 ```
 
-Gatekeeper is authless: it never checks a client credential. `UPSTREAM_API_KEY` is the credential it presents to the upstream, and it replaces whatever the client sent so a stale client key cannot leak past the proxy. Leave it unset to forward the client's own auth headers unchanged.
+Request-local mode is authless. Durable mode requires its separate Gatekeeper client token. `UPSTREAM_API_KEY` is the credential presented to the upstream, replacing whatever the client sent so a stale client key cannot leak past the proxy. Leave it unset to forward the client's own provider auth headers unchanged.
 
 ### Docker
 
@@ -269,11 +321,10 @@ docker pull ghcr.io/legitcamper/gatekeeper:latest
 docker run --rm --env-file .env -p 8080:8080 ghcr.io/legitcamper/gatekeeper:latest
 ```
 
-For Compose, copy the environment template, set a reachable upstream, then start the example:
+For Compose, follow the durable-storage setup above: set both independent secrets in a private `.env` file and configure a reachable upstream before starting the example. Do not overwrite an existing environment file or rotate an existing storage key:
 
 ```bash
-cp .env.example .env
-docker compose -f compose.yml up -d
+docker compose -f compose.yml up -d --build
 ```
 
 Inside a container, `localhost` refers to that container. Set `TARGET_URL` to an upstream Compose service name such as `http://ollama:11434`, or another host reachable from the container. If the GHCR package is private, authenticate first with `docker login ghcr.io`.
@@ -293,9 +344,11 @@ curl http://127.0.0.1:8080/v1/messages \
   }'
 ```
 
-No session header is required: strict wrapping carries opaque tokens across turns without global plaintext restoration. Use any request ID header when upstream observability needs correlation; it does not affect token restoration.
+In request-local mode, no session header is required: strict wrapping carries opaque tokens across turns without global plaintext restoration. Durable mode additionally requires the Gatekeeper client token and stable conversation identity described above. An ordinary request ID used for observability does not select restoration scope.
 
 ### Provider transparency
+
+The response and streaming policies in this section describe request-local mode. Durable mode adds authenticated conversation restoration, bounded response buffering, and fail-closed validation as described above.
 
 Gatekeeper is endpoint- and schema-neutral. Anthropic `/v1/messages`, OpenAI `/v1/chat/completions` or `/v1/responses`, and other provider routes use the same incoming path and query upstream. A path already present in `TARGET_URL` is retained as a prefix, and a query on it is kept as an upstream parameter: with `TARGET_URL=https://gateway.example/api?api-version=2024-02-01`, incoming `/v1/messages?beta=1` goes to `/api/v1/messages?beta=1&api-version=2024-02-01`. Configure `TARGET_URL` as the canonical provider or gateway base URL; Gatekeeper does not discover or rewrite provider endpoints.
 
@@ -334,6 +387,9 @@ Limits mirror the HTTP path. `GATEKEEPER_MAX_BODY_BYTES` caps frame and message 
 | `UPSTREAM_API_KEY` | unset | Upstream credential, injected in place of the client's. Falls back to `ANTHROPIC_API_KEY` |
 | `UPSTREAM_AUTH_HEADER` | `x-api-key` | Header carrying it. Use `authorization` for Bearer gateways and include the `Bearer ` prefix in the value |
 | `GATEKEEPER_MAX_BODY_BYTES` | `10485760` | Maximum buffered request/JSON response body |
+| `GATEKEEPER_DB_PATH` | unset | Enables durable storage; parent directory must exist |
+| `GATEKEEPER_OWNER_ID` | `local` | Stable owner namespace for this authenticated gateway instance |
+| `GATEKEEPER_CLIENT_TOKEN` | unset | Required with storage: separate random client credential, at least 32 printable ASCII characters |
 | `GATEKEEPER_REDACT` | unset | Comma-separated literal values to redact as `CUSTOM`, matched case-insensitively and whole-word |
 | `GATEKEEPER_REDACT_IDENTITY` | unset | `user`, `host`, or both: redact this machine's login name and hostname, read at startup |
 | `RUST_LOG` | `info` | Tracing filter |

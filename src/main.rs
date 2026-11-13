@@ -4,6 +4,7 @@ use anyhow::Context;
 use gatekeeper::config::Config;
 use gatekeeper::detector::Detector;
 use gatekeeper::proxy::{ProxyState, router, upstream_client};
+use gatekeeper::storage::MappingStore;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
@@ -13,13 +14,23 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::from_env().context("invalid Gatekeeper configuration")?;
     let detector = Arc::new(Detector::default().with_redactions(&config.redactions));
-    let state = ProxyState::new(
+    let mut state = ProxyState::new(
         config.target_url,
         upstream_client().context("failed to build upstream HTTP client")?,
         detector,
         config.max_body_bytes,
         config.upstream_auth,
     );
+    if let Some(storage) = config.storage {
+        let store = MappingStore::open(
+            &storage.path,
+            &storage.owner,
+            &storage.client_token,
+            config.max_body_bytes,
+        )
+        .context("failed to open persistent mapping store")?;
+        state = state.with_storage(Arc::new(store));
+    }
     let app = router(state);
     let listener = TcpListener::bind(config.listen_addr)
         .await

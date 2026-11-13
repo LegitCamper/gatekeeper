@@ -10,6 +10,8 @@ use aho_corasick::{AhoCorasick, MatchKind};
 use regex::Regex;
 use serde::Serialize;
 
+use crate::storage::{MappingStore, StorageError};
+
 /// Category of a detected value. Ordering of [`Kind::priority`] decides which
 /// category wins when two candidate spans overlap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -82,6 +84,8 @@ pub struct Detection {
 pub struct Anonymized {
     pub text: String,
     pub mappings: HashMap<String, String>,
+    #[serde(skip)]
+    collision: bool,
 }
 
 const DIGEST_LEN: usize = 12;
@@ -773,22 +777,30 @@ impl Detector {
     /// Replace every detected value with an opaque token, returning the token
     /// mappings required to restore the original text.
     pub fn anonymize(&self, text: &str) -> Anonymized {
+        self.anonymize_with(text, |kind, value| self.token(kind, value))
+    }
+
+    fn anonymize_with(&self, text: &str, token: impl Fn(Kind, &str) -> String) -> Anonymized {
         let detections = self.scan(text);
         if detections.is_empty() {
             return Anonymized {
                 text: text.to_owned(),
                 mappings: HashMap::new(),
+                collision: false,
             };
         }
 
         let mut output = String::with_capacity(text.len());
         let mut mappings = HashMap::new();
+        let mut collision = false;
         let mut cursor = 0;
         for detection in detections {
             output.push_str(&text[cursor..detection.start]);
-            let token = self.token(detection.kind, &detection.value);
+            let token = token(detection.kind, &detection.value);
             output.push_str(&token);
-            mappings.insert(token, detection.value);
+            if let Some(previous) = mappings.insert(token, detection.value.clone()) {
+                collision |= previous != detection.value;
+            }
             cursor = detection.end;
         }
         output.push_str(&text[cursor..]);
@@ -796,6 +808,7 @@ impl Detector {
         Anonymized {
             text: output,
             mappings,
+            collision,
         }
     }
 
@@ -817,7 +830,21 @@ impl Detector {
             wrapped: HashMap::new(),
             blocked: HashSet::new(),
             nonce: self.tokens.hash_one(("request", Instant::now())),
+            persistent: None,
+            collision: false,
         }
+    }
+
+    pub(crate) fn persistent_redactions(
+        self: &Arc<Self>,
+        store: Arc<MappingStore>,
+        conversation: String,
+        mappings: HashMap<String, String>,
+    ) -> RequestRedactions {
+        let mut redactions = self.request_redactions();
+        redactions.mappings = mappings;
+        redactions.persistent = Some((store, conversation));
+        redactions
     }
 
     fn fingerprint(&self, original: &str) -> u64 {
@@ -903,10 +930,15 @@ pub(crate) struct RequestRedactions {
     wrapped: HashMap<String, String>,
     blocked: HashSet<Digest>,
     nonce: u64,
+    persistent: Option<(Arc<MappingStore>, String)>,
+    collision: bool,
 }
 
 impl RequestRedactions {
     pub(crate) fn wrap_known(&mut self, text: &str) -> String {
+        if self.persistent.is_some() {
+            return text.to_owned();
+        }
         let now = Instant::now();
         let known: Vec<TokenCandidate> = {
             let mut seen = self.detector.seen();
@@ -945,8 +977,16 @@ impl RequestRedactions {
 
     pub(crate) fn protect(&mut self, text: &str) -> String {
         let wrapped = self.wrap_known(text);
-        let fresh = self.detector.anonymize(&wrapped);
+        let fresh = if let Some((store, conversation)) = &self.persistent {
+            self.detector.anonymize_with(&wrapped, |kind, original| {
+                store.token(conversation, kind.label(), original)
+            })
+        } else {
+            self.detector.anonymize(&wrapped)
+        };
+        self.collision |= fresh.collision;
         for (token, original) in fresh.mappings {
+            self.collision |= self.would_collide(&token, &original);
             if let Some(digest) = token_digest(&token) {
                 self.blocked.insert(digest);
             }
@@ -984,17 +1024,38 @@ impl RequestRedactions {
     }
 
     pub(crate) fn alias(&mut self, tokenized: String, original: String) {
+        self.collision |= self.persistent.is_some();
         self.mappings.entry(tokenized).or_insert(original);
     }
 
     pub(crate) fn finish(self) -> Restorer {
-        self.detector.register(&self.fresh);
+        if self.persistent.is_none() {
+            self.detector.register(&self.fresh);
+        }
         Restorer::new(&self.mappings)
+    }
+
+    pub(crate) fn finish_persistent(self) -> Result<Restorer, StorageError> {
+        if self.collision {
+            return Err(StorageError::Collision);
+        }
+        if let Some((store, conversation)) = &self.persistent {
+            store.save(conversation, &self.fresh)?;
+        }
+        Ok(self.finish())
     }
 
     pub(crate) fn len(&self) -> usize {
         self.mappings.len()
     }
+
+    pub(crate) fn has_new_redactions(&self) -> bool {
+        !self.fresh.is_empty() || !self.wrapped.is_empty()
+    }
+}
+
+pub(crate) fn contains_placeholder(text: &str) -> bool {
+    TOKEN_SHAPE.is_match(text)
 }
 
 /// Restores values from detached request-local mappings.

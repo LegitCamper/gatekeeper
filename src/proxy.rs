@@ -9,7 +9,7 @@ use axum::extract::State;
 use axum::http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use axum::http::{Request, Response, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use bytes::{Bytes, BytesMut};
 use futures_util::{Stream, StreamExt};
@@ -18,10 +18,14 @@ use serde_json::{Value, json};
 use url::{Position, Url};
 
 use crate::detector::{Detector, RequestRedactions, RestoreCarry, Restorer};
+use crate::storage::{MappingStore, StorageError, valid_id};
 use crate::toolguard;
 
 mod multipart;
+mod persistent;
 mod websocket;
+
+use persistent::{delete_conversation, persistent_response, storage_error};
 
 #[derive(Clone)]
 pub struct ProxyState {
@@ -30,6 +34,7 @@ pub struct ProxyState {
     detector: Arc<Detector>,
     max_body_bytes: usize,
     upstream_auth: Option<(HeaderName, HeaderValue)>,
+    storage: Option<Arc<MappingStore>>,
 }
 
 impl ProxyState {
@@ -46,7 +51,72 @@ impl ProxyState {
             detector,
             max_body_bytes,
             upstream_auth,
+            storage: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_storage(mut self, storage: Arc<MappingStore>) -> Self {
+        self.storage = Some(storage);
+        self
+    }
+
+    fn authenticate(&self, headers: &HeaderMap) -> bool {
+        self.storage.as_ref().is_none_or(|store| {
+            headers.get_all("x-gatekeeper-token").iter().count() == 1
+                && headers
+                    .get("x-gatekeeper-token")
+                    .is_some_and(|token| store.authenticate(token.as_bytes()))
+        })
+    }
+
+    fn conversation(&self, headers: &HeaderMap) -> Result<Option<String>, &'static str> {
+        if self.storage.is_none() {
+            return Ok(None);
+        }
+        let mut selected = None;
+        for name in ["x-gatekeeper-conversation-id", "thread-id", "thread_id"] {
+            for value in headers.get_all(name) {
+                let value = value.to_str().map_err(|_| "invalid conversation ID")?;
+                if !valid_id(value) || selected.is_some_and(|previous| previous != value) {
+                    return Err("invalid or conflicting conversation IDs");
+                }
+                selected = Some(value);
+            }
+        }
+        selected
+            .map(|value| Some(value.to_owned()))
+            .ok_or("persistent storage requires x-gatekeeper-conversation-id or thread-id")
+    }
+
+    async fn begin_redactions(
+        &self,
+        conversation: Option<String>,
+    ) -> Result<RequestRedactions, StorageError> {
+        let Some(store) = self.storage.clone() else {
+            return Ok(self.detector.request_redactions());
+        };
+        let conversation =
+            conversation.ok_or(StorageError::Configuration("missing conversation"))?;
+        let detector = Arc::clone(&self.detector);
+        tokio::task::spawn_blocking(move || {
+            let mappings = store.load(&conversation)?;
+            Ok(detector.persistent_redactions(store, conversation, mappings))
+        })
+        .await
+        .map_err(|_| StorageError::Worker)?
+    }
+
+    async fn finish_redactions(
+        &self,
+        redactions: RequestRedactions,
+    ) -> Result<Restorer, StorageError> {
+        if self.storage.is_none() {
+            return Ok(redactions.finish());
+        }
+        tokio::task::spawn_blocking(move || redactions.finish_persistent())
+            .await
+            .map_err(|_| StorageError::Worker)?
     }
 }
 
@@ -66,6 +136,7 @@ pub fn router(state: ProxyState) -> Router {
         .route("/health", get(health))
         .route("/healthz", get(health))
         .route("/scan", post(scan))
+        .route("/gatekeeper/conversation", delete(delete_conversation))
         .fallback(proxy)
         .with_state(state)
 }
@@ -80,6 +151,9 @@ struct ScanRequest {
 }
 
 async fn scan(State(state): State<ProxyState>, request: Request<Body>) -> Response<Body> {
+    if !state.authenticate(request.headers()) {
+        return json_error(StatusCode::UNAUTHORIZED, "invalid Gatekeeper client token");
+    }
     let body = match to_bytes(request.into_body(), state.max_body_bytes).await {
         Ok(body) => body,
         Err(_) => {
@@ -112,12 +186,19 @@ async fn scan(State(state): State<ProxyState>, request: Request<Body>) -> Respon
 }
 
 async fn proxy(State(state): State<ProxyState>, request: Request<Body>) -> Response<Body> {
+    if !state.authenticate(request.headers()) {
+        return json_error(StatusCode::UNAUTHORIZED, "invalid Gatekeeper client token");
+    }
+    let conversation = match state.conversation(request.headers()) {
+        Ok(conversation) => conversation,
+        Err(reason) => return json_error(StatusCode::BAD_REQUEST, reason),
+    };
     if request
         .headers()
         .get(header::UPGRADE)
         .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"websocket"))
     {
-        return websocket::proxy(state, request).await;
+        return websocket::proxy(state, request, conversation).await;
     }
     let content_type = content_type(request.headers()).map(str::to_owned);
     let connection_headers = connection_headers(request.headers());
@@ -152,7 +233,10 @@ async fn proxy(State(state): State<ProxyState>, request: Request<Body>) -> Respo
     // `content-type: application/json` on bodiless requests too, so an absent body
     // must never be judged against a header that only describes bodies.
     let body_is_blank = body.iter().all(u8::is_ascii_whitespace);
-    let mut redactions = state.detector.request_redactions();
+    let mut redactions = match state.begin_redactions(conversation).await {
+        Ok(redactions) => redactions,
+        Err(error) => return storage_error(error),
+    };
     let outgoing_body = if content_type
         .as_deref()
         .is_some_and(|kind| kind.eq_ignore_ascii_case("multipart/form-data"))
@@ -203,7 +287,10 @@ async fn proxy(State(state): State<ProxyState>, request: Request<Body>) -> Respo
             },
         }
     };
-    let restorer = redactions.finish();
+    let restorer = match state.finish_redactions(redactions).await {
+        Ok(restorer) => restorer,
+        Err(error) => return storage_error(error),
+    };
 
     let mut upstream = state.client.request(method, target);
     for (name, value) in &parts.headers {
@@ -243,6 +330,9 @@ async fn upstream_response(
     state: &ProxyState,
     restorer: Restorer,
 ) -> Response<Body> {
+    if state.storage.is_some() {
+        return persistent_response(upstream, state.max_body_bytes, restorer).await;
+    }
     let status = upstream.status();
     let headers = upstream.headers().clone();
     let response_connection_headers = connection_headers(&headers);
@@ -423,6 +513,16 @@ fn anonymize_json(value: &mut Value, redactions: &mut RequestRedactions) {
     anonymize_json_at_depth(value, redactions, 0);
 }
 
+fn is_base64_object(values: &serde_json::Map<String, Value>) -> bool {
+    values.get("type").and_then(Value::as_str) == Some("base64")
+        || values.get("mimeType").is_some_and(Value::is_string)
+        || values.get("mime_type").is_some_and(Value::is_string)
+        || matches!(
+            values.get("format").and_then(Value::as_str),
+            Some("wav" | "mp3")
+        )
+}
+
 fn anonymize_json_at_depth(value: &mut Value, redactions: &mut RequestRedactions, depth: usize) {
     match value {
         Value::String(text) => anonymize_string(text, redactions, depth),
@@ -433,13 +533,7 @@ fn anonymize_json_at_depth(value: &mut Value, redactions: &mut RequestRedactions
         }
         Value::Object(values) => {
             // Encoded media is opaque; digit runs inside it are not phone numbers.
-            let base64_data = values.get("type").and_then(Value::as_str) == Some("base64")
-                || values.get("mimeType").is_some_and(Value::is_string)
-                || values.get("mime_type").is_some_and(Value::is_string)
-                || matches!(
-                    values.get("format").and_then(Value::as_str),
-                    Some("wav" | "mp3")
-                );
+            let base64_data = is_base64_object(values);
             let original = std::mem::take(values);
             for (key, mut value) in original {
                 if !is_opaque_json_field(&key, &value, base64_data) {
@@ -513,8 +607,11 @@ fn restore_json(value: &mut Value, restorer: &Restorer) -> bool {
         }
         Value::Object(values) => {
             let mut changed = false;
-            for value in values.values_mut() {
-                changed |= restore_json(value, restorer);
+            let base64_data = is_base64_object(values);
+            for (key, value) in values.iter_mut() {
+                if !is_opaque_json_field(key, value, base64_data) {
+                    changed |= restore_json(value, restorer);
+                }
             }
             changed |= restore_object_keys(values, restorer);
             changed
@@ -858,8 +955,12 @@ fn restore_json_fields(
         }
         Value::Object(values) => {
             let discriminators = stream_discriminators(values);
+            let base64_data = is_base64_object(values);
             path.extend(discriminators.iter().cloned());
             for (key, value) in values.iter_mut() {
+                if is_opaque_json_field(key, value, base64_data) {
+                    continue;
+                }
                 // ponytail: metadata restores per event; split identifier tokens
                 // need their own buffer. "lookup_contact" must not stall arguments.
                 if value.is_string()
@@ -1047,6 +1148,12 @@ fn is_auth_header(name: &HeaderName) -> bool {
 }
 
 fn filtered_header(name: &HeaderName, connection_headers: &HashSet<HeaderName>) -> bool {
+    if matches!(
+        name.as_str(),
+        "x-gatekeeper-token" | "x-gatekeeper-conversation-id"
+    ) {
+        return true;
+    }
     name == header::HOST
         || name == header::CONTENT_LENGTH
         || name == header::CONNECTION

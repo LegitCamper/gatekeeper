@@ -5,9 +5,14 @@ services:
     container_name: gatekeeper
     # env_file: .env
     environment:
-      TARGET_URL=http://ollama:11434
+      TARGET_URL: http://ollama:11434
+      GATEKEEPER_DB_PATH: /var/lib/gatekeeper/mappings.sqlite3
+      GATEKEEPER_OWNER_ID: ${GATEKEEPER_OWNER_ID:-local}
+      GATEKEEPER_CLIENT_TOKEN: ${GATEKEEPER_CLIENT_TOKEN:?Set a random client token in .env}
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - gatekeeper_data:/var/lib/gatekeeper
     restart: unless-stopped
 
   ollama:
@@ -27,4 +32,5 @@ services:
     #           capabilities: [gpu]
 
 volumes:
+  gatekeeper_data:
   ollama:
