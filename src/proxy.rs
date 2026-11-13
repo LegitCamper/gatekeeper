@@ -546,12 +546,12 @@ fn anonymize_json_at_depth(value: &mut Value, redactions: &mut RequestRedactions
                     } else {
                         format!("{key}{attempt}")
                     };
-                    let candidate = protect_string(source.clone(), redactions, depth);
+                    let candidate = protect_string(source, redactions, depth);
                     if !values.contains_key(&candidate)
                         && !redactions.would_collide(&candidate, &key)
                     {
                         if attempt > 0 {
-                            redactions.alias(candidate.clone(), key.clone());
+                            redactions.alias(candidate.clone(), key);
                         }
                         break candidate;
                     }
