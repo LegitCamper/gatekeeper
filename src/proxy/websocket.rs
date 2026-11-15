@@ -15,11 +15,7 @@ type Upstream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type Frame = tungstenite::Message;
 const MAX_QUEUED_TURNS: usize = 64;
 
-pub(super) async fn proxy(
-    state: ProxyState,
-    request: Request<Body>,
-    conversation: Option<String>,
-) -> Response<Body> {
+pub(super) async fn proxy(state: ProxyState, request: Request<Body>) -> Response<Body> {
     let target = match target_url(&state.target_url, request.uri()) {
         Ok(mut url) => {
             let scheme = match url.scheme() {
@@ -100,7 +96,7 @@ pub(super) async fn proxy(
         .protocols(selected)
         .max_message_size(state.max_body_bytes)
         .max_frame_size(state.max_body_bytes)
-        .on_upgrade(move |client| bridge(client, upstream, state, conversation))
+        .on_upgrade(move |client| bridge(client, upstream, state))
 }
 
 struct Turn {
@@ -109,7 +105,6 @@ struct Turn {
     buffered: Vec<(String, String, bool)>,
     bytes: usize,
     request_bytes: usize,
-    persistent: bool,
 }
 
 impl Turn {
@@ -131,22 +126,6 @@ impl Turn {
     ) -> Vec<(String, bool)> {
         let restored = restore_stream_json(raw, &mut self.pending, &self.restorer)
             .unwrap_or_else(|| self.restorer.restore(raw));
-        if self.persistent {
-            self.bytes += raw.len().max(restored.len());
-            self.buffered.push((raw.to_owned(), restored, binary));
-            if terminal {
-                if self.pending.has_unresolved_fields() {
-                    return self.flush();
-                }
-                self.bytes = 0;
-                return self
-                    .buffered
-                    .drain(..)
-                    .map(|(_, restored, binary)| (restored, binary))
-                    .collect();
-            }
-            return Vec::new();
-        }
         if self.buffered.is_empty() && !self.pending.has_unresolved_fields() {
             return vec![(restored, binary)];
         }
@@ -196,12 +175,7 @@ async fn error(client: &mut WebSocket, message: &str) -> bool {
         .is_ok()
 }
 
-async fn bridge(
-    mut client: WebSocket,
-    mut upstream: Upstream,
-    state: ProxyState,
-    conversation: Option<String>,
-) {
+async fn bridge(mut client: WebSocket, mut upstream: Upstream, state: ProxyState) {
     let mut lanes: HashMap<String, VecDeque<Turn>> = HashMap::new();
     let mut closing = Some(CloseFrame {
         code: 1011,
@@ -228,11 +202,7 @@ async fn bridge(
                             Err(reason) => { if !error(&mut client, reason).await { break; } continue; }
                         };
                         let starts_turn = value["type"] == "response.create";
-                        let scoped = conversation.as_ref().map(|conversation| MappingStore::lane(conversation, &stream_id));
-                        let mut redactions = match state.begin_redactions(scoped).await {
-                            Ok(redactions) => redactions,
-                            Err(reason) => { if !error(&mut client, &reason.to_string()).await { break; } continue; }
-                        };
+                        let mut redactions = state.begin_redactions();
                         if let Some(object) = value.as_object_mut() { object.remove("stream_id"); }
                         anonymize_request_value(&mut value, &mut redactions);
                         // Lane names are routing metadata, never model text.
@@ -251,7 +221,6 @@ async fn bridge(
                             lanes.entry(stream_id).or_default().push_back(Turn {
                                 restorer, pending: StreamCarry::default(),
                                 buffered: Vec::new(), bytes: 0, request_bytes: text.len(),
-                                persistent: state.storage.is_some(),
                             });
                         } else if redactions.has_new_redactions() {
                             // No response identity exists for arbitrary control events.
@@ -261,13 +230,7 @@ async fn bridge(
                         if binary_json { Frame::Binary(value.to_string().into_bytes().into()) }
                         else { Frame::Text(value.to_string().into()) }
                     }
-                    Message::Binary(bytes) => {
-                        if state.storage.is_some() {
-                            if !error(&mut client, "persistent WebSocket input must contain JSON").await { break; }
-                            continue;
-                        }
-                        Frame::Binary(bytes)
-                    }
+                    Message::Binary(bytes) => Frame::Binary(bytes),
                     Message::Ping(bytes) => { if client.send(Message::Pong(bytes)).await.is_err() { break; } continue; }
                     Message::Pong(_) => continue,
                     Message::Close(frame) => {
@@ -295,28 +258,12 @@ async fn bridge(
                             matches!(kind, "response.completed" | "response.failed" | "response.incomplete" | "response.cancelled" | "response.done" | "error")
                         });
                         let buffered_bytes = lanes.values().flatten().map(|turn| turn.bytes).sum::<usize>();
-                        if state.storage.is_some() && buffered_bytes.saturating_add(text.len()) > state.max_body_bytes {
-                            let _ = error(&mut client, "persistent response exceeds its inspection limit").await;
-                            return;
-                        }
                         let messages = if let Some(turn) = stream_id.as_ref()
                             .and_then(|id| lanes.get_mut(id)).and_then(|queue| queue.front_mut()) {
                             turn.restore(&text, terminal, state.max_body_bytes.saturating_sub(buffered_bytes), binary_json)
                         } else {
-                            if state.storage.is_some() && !matches!(value.as_ref().and_then(|value| value["type"].as_str()), Some("session.created" | "session.updated" | "rate_limits.updated" | "error")) {
-                                let _ = error(&mut client, "persistent WebSocket output has no matching response turn").await;
-                                return;
-                            }
                             vec![(text.to_string(), binary_json)]
                         };
-                        if state.storage.is_some() {
-                            let size = lanes.values().flatten().map(|turn| turn.bytes).sum::<usize>()
-                                .saturating_add(messages.iter().map(|(text, _)| text.len()).sum::<usize>());
-                            if size > state.max_body_bytes || persistent::unresolved_messages(messages.iter().map(|(text, _)| text.as_str())) {
-                                let _ = error(&mut client, "persistent response contains unresolved placeholders or exceeds its inspection limit").await;
-                                return;
-                            }
-                        }
                         for (message, binary) in messages {
                             let message = if binary { Message::Binary(message.into_bytes().into()) } else { Message::Text(message.into()) };
                             if client.send(message).await.is_err() { return; }
@@ -327,10 +274,6 @@ async fn bridge(
                         }
                     }
                     Frame::Binary(bytes) => {
-                        if state.storage.is_some() {
-                            let _ = error(&mut client, "persistent WebSocket output must contain JSON").await;
-                            return;
-                        }
                         if client.send(Message::Binary(bytes)).await.is_err() { break; }
                     }
                     Frame::Ping(bytes) => { if upstream.send(Frame::Pong(bytes)).await.is_err() { break; } }
@@ -345,14 +288,6 @@ async fn bridge(
         }
     }
     for turn in lanes.values_mut().flatten() {
-        if turn.persistent {
-            let _ = error(
-                &mut client,
-                "upstream ended before persistent response validation",
-            )
-            .await;
-            continue;
-        }
         for (message, binary) in turn.flush() {
             let message = if binary {
                 Message::Binary(message.into_bytes().into())

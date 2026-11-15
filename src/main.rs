@@ -21,15 +21,12 @@ async fn main() -> anyhow::Result<()> {
         config.max_body_bytes,
         config.upstream_auth,
     );
-    if let Some(storage) = config.storage {
-        let store = MappingStore::open(
-            &storage.path,
-            &storage.owner,
-            &storage.client_token,
-            config.max_body_bytes,
-        )
-        .context("failed to open persistent mapping store")?;
+    if let Some(path) = &config.storage.path {
+        let store = MappingStore::open(path).context("failed to open persistent mapping store")?;
         state = state.with_storage(Arc::new(store));
+    }
+    if let Some(token) = &config.storage.client_token {
+        state = state.with_client_token(token);
     }
     let app = router(state);
     let listener = TcpListener::bind(config.listen_addr)

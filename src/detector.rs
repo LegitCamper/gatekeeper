@@ -831,6 +831,7 @@ impl Detector {
             blocked: HashSet::new(),
             nonce: self.tokens.hash_one(("request", Instant::now())),
             persistent: None,
+            literals: HashSet::new(),
             collision: false,
         }
     }
@@ -838,12 +839,9 @@ impl Detector {
     pub(crate) fn persistent_redactions(
         self: &Arc<Self>,
         store: Arc<MappingStore>,
-        conversation: String,
-        mappings: HashMap<String, String>,
     ) -> RequestRedactions {
         let mut redactions = self.request_redactions();
-        redactions.mappings = mappings;
-        redactions.persistent = Some((store, conversation));
+        redactions.persistent = Some(store);
         redactions
     }
 
@@ -930,7 +928,9 @@ pub(crate) struct RequestRedactions {
     wrapped: HashMap<String, String>,
     blocked: HashSet<Digest>,
     nonce: u64,
-    persistent: Option<(Arc<MappingStore>, String)>,
+    persistent: Option<Arc<MappingStore>>,
+    /// Placeholder-shaped literals the client sent; echoes stay verbatim.
+    literals: HashSet<String>,
     collision: bool,
 }
 
@@ -976,10 +976,17 @@ impl RequestRedactions {
     }
 
     pub(crate) fn protect(&mut self, text: &str) -> String {
+        if self.persistent.is_some() {
+            self.literals.extend(
+                TOKEN_SHAPE
+                    .find_iter(text)
+                    .map(|token| token.as_str().to_ascii_lowercase()),
+            );
+        }
         let wrapped = self.wrap_known(text);
-        let fresh = if let Some((store, conversation)) = &self.persistent {
+        let fresh = if let Some(store) = &self.persistent {
             self.detector.anonymize_with(&wrapped, |kind, original| {
-                store.token(conversation, kind.label(), original)
+                store.token(kind.label(), original)
             })
         } else {
             self.detector.anonymize(&wrapped)
@@ -1032,15 +1039,18 @@ impl RequestRedactions {
         if self.persistent.is_none() {
             self.detector.register(&self.fresh);
         }
-        Restorer::new(&self.mappings)
+        let mut restorer = Restorer::new(&self.mappings);
+        restorer.store = self.persistent;
+        restorer.literals = self.literals;
+        restorer
     }
 
     pub(crate) fn finish_persistent(self) -> Result<Restorer, StorageError> {
         if self.collision {
             return Err(StorageError::Collision);
         }
-        if let Some((store, conversation)) = &self.persistent {
-            store.save(conversation, &self.fresh)?;
+        if let Some(store) = &self.persistent {
+            store.save(&self.fresh)?;
         }
         Ok(self.finish())
     }
@@ -1054,14 +1064,13 @@ impl RequestRedactions {
     }
 }
 
-pub(crate) fn contains_placeholder(text: &str) -> bool {
-    TOKEN_SHAPE.is_match(text)
-}
-
-/// Restores values from detached request-local mappings.
+/// Restores values from request-local mappings, falling back to the global
+/// store when one is configured.
 pub(crate) struct Restorer {
     tokens: HashMap<String, String>,
     digests: HashMap<Digest, Option<String>>,
+    store: Option<Arc<MappingStore>>,
+    literals: HashSet<String>,
 }
 
 #[derive(Default)]
@@ -1090,11 +1099,43 @@ impl Restorer {
         Self {
             tokens: mappings.clone(),
             digests,
+            store: None,
+            literals: HashSet::new(),
         }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.tokens.is_empty()
+        self.tokens.is_empty() && self.store.is_none()
+    }
+
+    /// Original for a digest: this request first, then the global store.
+    fn lookup(&self, digest: Digest) -> Option<String> {
+        match self.digests.get(&digest) {
+            Some(original) => original.clone(),
+            None => self.store.as_ref()?.original(&digest.hex()),
+        }
+    }
+
+    fn knows_prefix(&self, prefix: &str) -> bool {
+        self.digests
+            .iter()
+            .any(|(digest, original)| original.is_some() && digest.starts_with(prefix))
+            || self
+                .store
+                .as_ref()
+                .is_some_and(|store| store.has_prefix(prefix))
+    }
+
+    /// A canonical `[KIND_digest]` the store has never minted gets a stable fake
+    /// of its kind, so probing digests cannot tell real values from misses.
+    fn decoy(&self, span: &str, digest: Digest) -> Option<String> {
+        let store = self.store.as_ref()?;
+        TOKEN_SHAPE
+            .find(span)
+            .filter(|found| found.start() == 0 && found.end() == span.len())
+            .filter(|_| !self.literals.contains(&span.to_ascii_lowercase()))?;
+        let (label, _) = span[1..].rsplit_once('_')?;
+        Some(decoy(label, store.decoy_seed(&digest.hex())))
     }
 
     #[cfg(test)]
@@ -1110,7 +1151,7 @@ impl Restorer {
     }
 
     pub(crate) fn restore_fragment(&self, text: &str, carry: &mut RestoreCarry) -> String {
-        if self.tokens.is_empty() {
+        if self.is_empty() {
             return text.to_owned();
         }
 
@@ -1129,11 +1170,9 @@ impl Restorer {
             combined
         };
         let mut keep = partial_suffix_len(&full_text, self);
-        let complete_source = token_candidates(&full_text).iter().any(|candidate| {
-            self.digests
-                .get(&candidate.digest)
-                .is_some_and(Option::is_some)
-        });
+        let complete_source = token_candidates(&full_text)
+            .iter()
+            .any(|candidate| self.lookup(candidate.digest).is_some());
         if complete_source
             || (!had_carry
                 && !looks_decorated_prefix(&full_text)
@@ -1173,9 +1212,11 @@ impl Restorer {
                 .peek()
                 .filter(|candidate| candidate.start == cursor)
                 .copied()
-                && let Some(Some(original)) = self.digests.get(&candidate.digest)
+                && let Some(original) = self.lookup(candidate.digest).or_else(|| {
+                    self.decoy(&source[candidate.start..candidate.end], candidate.digest)
+                })
             {
-                output.push_str(original);
+                output.push_str(&original);
                 cursor = candidate.end;
                 candidates.next();
                 if candidate.end == source.len() && !source.ends_with(']') {
@@ -1338,11 +1379,7 @@ fn partial_suffix_len(text: &str, restorer: &Restorer) -> usize {
             // A suffix already containing a complete candidate must be processed,
             // not held as though it were only a prefix.
             if token_candidates(suffix).first().is_some_and(|candidate| {
-                candidate.start == 0
-                    && restorer
-                        .digests
-                        .get(&candidate.digest)
-                        .is_some_and(Option::is_some)
+                candidate.start == 0 && restorer.lookup(candidate.digest).is_some()
             }) {
                 return false;
             }
@@ -1377,10 +1414,7 @@ fn known_digest_prefix(text: &str, restorer: &Restorer) -> bool {
     if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return false;
     }
-    restorer
-        .digests
-        .iter()
-        .any(|(digest, original)| original.is_some() && digest.starts_with(text))
+    restorer.knows_prefix(text)
 }
 
 fn noise_stripped_digest_prefix(text: &str, restorer: &Restorer) -> bool {
@@ -1419,8 +1453,198 @@ fn token_decoration_prefix(text: &str, restorer: &Restorer) -> bool {
         else {
             return false;
         };
-        suffix.is_empty() || known_digest_prefix(suffix, restorer)
+        suffix.is_empty()
+            || known_digest_prefix(suffix, restorer)
+            // An unknown canonical digest still needs holding whole to get its decoy.
+            || (restorer.store.is_some()
+                && suffix.len() < DIGEST_LEN
+                && suffix.bytes().all(|byte| byte.is_ascii_hexdigit()))
     })
+}
+
+const DECOY_SURNAMES: &[&str] = &[
+    "Smith",
+    "Johnson",
+    "Williams",
+    "Brown",
+    "Jones",
+    "Garcia",
+    "Miller",
+    "Davis",
+    "Rodriguez",
+    "Martinez",
+    "Hernandez",
+    "Lopez",
+    "Gonzalez",
+    "Wilson",
+    "Anderson",
+    "Thomas",
+    "Taylor",
+    "Moore",
+    "Jackson",
+    "Martin",
+    "Lee",
+    "Perez",
+    "Thompson",
+    "White",
+    "Harris",
+    "Sanchez",
+    "Clark",
+    "Ramirez",
+    "Lewis",
+    "Robinson",
+    "Walker",
+    "Young",
+    "Allen",
+    "King",
+    "Wright",
+    "Scott",
+    "Torres",
+    "Nguyen",
+    "Hill",
+    "Flores",
+    "Green",
+    "Adams",
+    "Nelson",
+    "Baker",
+    "Hall",
+    "Rivera",
+    "Campbell",
+    "Mitchell",
+    "Carter",
+    "Roberts",
+    "Patel",
+    "Kim",
+    "Chen",
+    "Singh",
+];
+const DECOY_STREETS: &[&str] = &[
+    "Oak",
+    "Maple",
+    "Cedar",
+    "Pine",
+    "Elm",
+    "Washington",
+    "Lake",
+    "Hill",
+    "Park",
+    "Main",
+    "Sunset",
+    "Ridge",
+    "Highland",
+    "Willow",
+    "Meadow",
+    "River",
+    "Church",
+    "Spring",
+];
+const DECOY_DOMAINS: &[&str] = &[
+    "gmail.com",
+    "outlook.com",
+    "yahoo.com",
+    "icloud.com",
+    "proton.me",
+];
+
+struct DecoyRng {
+    seed: [u8; 32],
+    cursor: usize,
+}
+
+impl DecoyRng {
+    fn next(&mut self, bound: usize) -> usize {
+        let pair = [
+            self.seed[self.cursor % 32],
+            self.seed[(self.cursor + 1) % 32],
+        ];
+        self.cursor += 2;
+        usize::from(u16::from_be_bytes(pair)) % bound
+    }
+
+    fn pick<'a>(&mut self, items: &[&'a str]) -> &'a str {
+        items[self.next(items.len())]
+    }
+}
+
+/// Deterministic fake value shaped like `label`, drawn from `seed`.
+fn decoy(label: &str, seed: [u8; 32]) -> String {
+    let mut rng = DecoyRng { seed, cursor: 0 };
+    static NAMES: LazyLock<Vec<&str>> = LazyLock::new(|| {
+        GIVEN_NAMES
+            .lines()
+            .filter(|name| !name.is_empty())
+            .collect()
+    });
+    let given = NAMES[rng.next(NAMES.len())];
+    let surname = rng.pick(DECOY_SURNAMES);
+    match label.to_ascii_uppercase().as_str() {
+        "EMAIL" => format!(
+            "{}.{}@{}",
+            given.to_lowercase(),
+            surname.to_lowercase(),
+            rng.pick(DECOY_DOMAINS)
+        ),
+        "PHONE" => format!(
+            "({}) {}-{:04}",
+            201 + rng.next(788),
+            200 + rng.next(800),
+            rng.next(10_000)
+        ),
+        "SSN" => format!(
+            "{:03}-{:02}-{:04}",
+            1 + rng.next(665),
+            1 + rng.next(99),
+            1 + rng.next(9999)
+        ),
+        "CARD" => {
+            let mut digits: Vec<u32> = std::iter::once(4)
+                .chain((0..14).map(|_| rng.next(10) as u32))
+                .collect();
+            let sum: u32 = digits
+                .iter()
+                .rev()
+                .enumerate()
+                .map(|(index, digit)| {
+                    if index % 2 == 0 {
+                        let doubled = digit * 2;
+                        doubled / 10 + doubled % 10
+                    } else {
+                        *digit
+                    }
+                })
+                .sum();
+            digits.push((10 - sum % 10) % 10);
+            digits.iter().map(u32::to_string).collect()
+        }
+        "IP" => format!(
+            "{}.{}.{}.{}",
+            [24, 38, 52, 68, 73, 98, 104, 142, 172, 185][rng.next(10)],
+            rng.next(256),
+            rng.next(256),
+            1 + rng.next(254)
+        ),
+        "DOB" => format!(
+            "{}-{:02}-{:02}",
+            1950 + rng.next(56),
+            1 + rng.next(12),
+            1 + rng.next(28)
+        ),
+        "ADDRESS" => format!(
+            "{} {} {}",
+            100 + rng.next(9900),
+            rng.pick(DECOY_STREETS),
+            rng.pick(&["St", "Ave", "Rd", "Ln", "Dr"])
+        ),
+        "PATH" => format!("/home/{}", given.to_lowercase()),
+        "API_KEY" => (0..40)
+            .map(|_| {
+                b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"[rng.next(62)]
+                    as char
+            })
+            .collect(),
+        "CUSTOM" => format!("{}{}", given.to_lowercase(), rng.next(100)),
+        _ => format!("{given} {surname}"),
+    }
 }
 
 /// Replace known tokens and model-mutated forms with original values.

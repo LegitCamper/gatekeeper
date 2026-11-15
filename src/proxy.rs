@@ -1,7 +1,9 @@
 //! Axum routes and transparent upstream proxying.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+
+use ring::hmac;
 
 use async_stream::try_stream;
 use axum::body::{Body, to_bytes};
@@ -9,7 +11,7 @@ use axum::extract::State;
 use axum::http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use axum::http::{Request, Response, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::{delete, get, post};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use bytes::{Bytes, BytesMut};
 use futures_util::{Stream, StreamExt};
@@ -18,14 +20,11 @@ use serde_json::{Value, json};
 use url::{Position, Url};
 
 use crate::detector::{Detector, RequestRedactions, RestoreCarry, Restorer};
-use crate::storage::{MappingStore, StorageError, valid_id};
+use crate::storage::{MappingStore, StorageError};
 use crate::toolguard;
 
 mod multipart;
-mod persistent;
 mod websocket;
-
-use persistent::{delete_conversation, persistent_response, storage_error};
 
 #[derive(Clone)]
 pub struct ProxyState {
@@ -35,6 +34,7 @@ pub struct ProxyState {
     max_body_bytes: usize,
     upstream_auth: Option<(HeaderName, HeaderValue)>,
     storage: Option<Arc<MappingStore>>,
+    client_token: Option<hmac::Tag>,
 }
 
 impl ProxyState {
@@ -52,6 +52,7 @@ impl ProxyState {
             max_body_bytes,
             upstream_auth,
             storage: None,
+            client_token: None,
         }
     }
 
@@ -61,50 +62,28 @@ impl ProxyState {
         self
     }
 
+    /// Require `x-gatekeeper-token` on every request. Off by default for
+    /// gateways already behind a firewall or authenticating proxy.
+    #[must_use]
+    pub fn with_client_token(mut self, token: &str) -> Self {
+        self.client_token = Some(hmac::sign(client_token_key(), token.as_bytes()));
+        self
+    }
+
     fn authenticate(&self, headers: &HeaderMap) -> bool {
-        self.storage.as_ref().is_none_or(|store| {
+        self.client_token.as_ref().is_none_or(|expected| {
             headers.get_all("x-gatekeeper-token").iter().count() == 1
-                && headers
-                    .get("x-gatekeeper-token")
-                    .is_some_and(|token| store.authenticate(token.as_bytes()))
+                && headers.get("x-gatekeeper-token").is_some_and(|token| {
+                    hmac::verify(client_token_key(), token.as_bytes(), expected.as_ref()).is_ok()
+                })
         })
     }
 
-    fn conversation(&self, headers: &HeaderMap) -> Result<Option<String>, &'static str> {
-        if self.storage.is_none() {
-            return Ok(None);
+    fn begin_redactions(&self) -> RequestRedactions {
+        match &self.storage {
+            Some(store) => self.detector.persistent_redactions(Arc::clone(store)),
+            None => self.detector.request_redactions(),
         }
-        let mut selected = None;
-        for name in ["x-gatekeeper-conversation-id", "thread-id", "thread_id"] {
-            for value in headers.get_all(name) {
-                let value = value.to_str().map_err(|_| "invalid conversation ID")?;
-                if !valid_id(value) || selected.is_some_and(|previous| previous != value) {
-                    return Err("invalid or conflicting conversation IDs");
-                }
-                selected = Some(value);
-            }
-        }
-        selected
-            .map(|value| Some(value.to_owned()))
-            .ok_or("persistent storage requires x-gatekeeper-conversation-id or thread-id")
-    }
-
-    async fn begin_redactions(
-        &self,
-        conversation: Option<String>,
-    ) -> Result<RequestRedactions, StorageError> {
-        let Some(store) = self.storage.clone() else {
-            return Ok(self.detector.request_redactions());
-        };
-        let conversation =
-            conversation.ok_or(StorageError::Configuration("missing conversation"))?;
-        let detector = Arc::clone(&self.detector);
-        tokio::task::spawn_blocking(move || {
-            let mappings = store.load(&conversation)?;
-            Ok(detector.persistent_redactions(store, conversation, mappings))
-        })
-        .await
-        .map_err(|_| StorageError::Worker)?
     }
 
     async fn finish_redactions(
@@ -118,6 +97,21 @@ impl ProxyState {
             .await
             .map_err(|_| StorageError::Worker)?
     }
+}
+
+/// Process-random key: client tokens are compared as HMAC tags, which keeps the
+/// comparison constant-time without storing the token itself.
+fn client_token_key() -> &'static hmac::Key {
+    static KEY: LazyLock<hmac::Key> = LazyLock::new(|| {
+        hmac::Key::generate(hmac::HMAC_SHA256, &ring::rand::SystemRandom::new())
+            .expect("system randomness is available")
+    });
+    &KEY
+}
+
+fn storage_error(error: StorageError) -> Response<Body> {
+    tracing::error!(%error, "persistent mapping operation failed");
+    json_error(StatusCode::SERVICE_UNAVAILABLE, error.to_string())
 }
 
 /// Builds the provider-facing client without following redirects.
@@ -136,7 +130,6 @@ pub fn router(state: ProxyState) -> Router {
         .route("/health", get(health))
         .route("/healthz", get(health))
         .route("/scan", post(scan))
-        .route("/gatekeeper/conversation", delete(delete_conversation))
         .fallback(proxy)
         .with_state(state)
 }
@@ -189,16 +182,12 @@ async fn proxy(State(state): State<ProxyState>, request: Request<Body>) -> Respo
     if !state.authenticate(request.headers()) {
         return json_error(StatusCode::UNAUTHORIZED, "invalid Gatekeeper client token");
     }
-    let conversation = match state.conversation(request.headers()) {
-        Ok(conversation) => conversation,
-        Err(reason) => return json_error(StatusCode::BAD_REQUEST, reason),
-    };
     if request
         .headers()
         .get(header::UPGRADE)
         .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"websocket"))
     {
-        return websocket::proxy(state, request, conversation).await;
+        return websocket::proxy(state, request).await;
     }
     let content_type = content_type(request.headers()).map(str::to_owned);
     let connection_headers = connection_headers(request.headers());
@@ -233,10 +222,7 @@ async fn proxy(State(state): State<ProxyState>, request: Request<Body>) -> Respo
     // `content-type: application/json` on bodiless requests too, so an absent body
     // must never be judged against a header that only describes bodies.
     let body_is_blank = body.iter().all(u8::is_ascii_whitespace);
-    let mut redactions = match state.begin_redactions(conversation).await {
-        Ok(redactions) => redactions,
-        Err(error) => return storage_error(error),
-    };
+    let mut redactions = state.begin_redactions();
     let outgoing_body = if content_type
         .as_deref()
         .is_some_and(|kind| kind.eq_ignore_ascii_case("multipart/form-data"))
@@ -330,9 +316,6 @@ async fn upstream_response(
     state: &ProxyState,
     restorer: Restorer,
 ) -> Response<Body> {
-    if state.storage.is_some() {
-        return persistent_response(upstream, state.max_body_bytes, restorer).await;
-    }
     let status = upstream.status();
     let headers = upstream.headers().clone();
     let response_connection_headers = connection_headers(&headers);
@@ -1148,10 +1131,7 @@ fn is_auth_header(name: &HeaderName) -> bool {
 }
 
 fn filtered_header(name: &HeaderName, connection_headers: &HashSet<HeaderName>) -> bool {
-    if matches!(
-        name.as_str(),
-        "x-gatekeeper-token" | "x-gatekeeper-conversation-id"
-    ) {
+    if matches!(name.as_str(), "x-gatekeeper-token") {
         return true;
     }
     name == header::HOST

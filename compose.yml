@@ -7,8 +7,8 @@ services:
     environment:
       TARGET_URL: http://ollama:11434
       GATEKEEPER_DB_PATH: /var/lib/gatekeeper/mappings.sqlite3
-      GATEKEEPER_OWNER_ID: ${GATEKEEPER_OWNER_ID:-local}
-      GATEKEEPER_CLIENT_TOKEN: ${GATEKEEPER_CLIENT_TOKEN:?Set a random client token in .env}
+      # Opt-in: require x-gatekeeper-token when not behind a firewall/WAF.
+      GATEKEEPER_CLIENT_TOKEN: ${GATEKEEPER_CLIENT_TOKEN:-}
     ports:
       - "127.0.0.1:8080:8080"
     volumes:

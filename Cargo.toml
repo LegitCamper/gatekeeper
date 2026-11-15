@@ -3,7 +3,7 @@ name = "gatekeeper"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "A PII gateway with optional durable conversation-scoped restoration"
+description = "A PII gateway with optional durable global restoration"
 license = "MIT"
 publish = false
 

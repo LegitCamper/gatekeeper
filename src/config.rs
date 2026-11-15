@@ -49,14 +49,15 @@ pub struct Config {
     /// Literal values redacted as `CUSTOM` on top of the built-in PII rules.
     /// See [`Config::from_env`] for the variables that fill it.
     pub redactions: Vec<String>,
-    pub storage: Option<StorageConfig>,
+    pub storage: StorageConfig,
 }
 
 #[derive(Clone)]
 pub struct StorageConfig {
-    pub path: PathBuf,
-    pub owner: String,
-    pub client_token: String,
+    /// Global mapping database. `None` keeps request-local restoration.
+    pub path: Option<PathBuf>,
+    /// Opt-in `x-gatekeeper-token` requirement.
+    pub client_token: Option<String>,
 }
 
 impl std::fmt::Debug for StorageConfig {
@@ -68,34 +69,21 @@ impl std::fmt::Debug for StorageConfig {
     }
 }
 
-fn storage() -> Result<Option<StorageConfig>, ConfigError> {
-    let Some(path) = optional_env("GATEKEEPER_DB_PATH")? else {
-        return Ok(None);
-    };
-    let owner = optional_env("GATEKEEPER_OWNER_ID")?.unwrap_or_else(|| "local".to_owned());
-    if !crate::storage::valid_id(&owner) {
-        return Err(storage_error(
-            "GATEKEEPER_OWNER_ID",
-            "expected 1-256 ASCII letters, digits, dots, underscores, or hyphens",
-        ));
-    }
-    let client_token = optional_env("GATEKEEPER_CLIENT_TOKEN")?.ok_or_else(|| {
-        storage_error(
-            "GATEKEEPER_CLIENT_TOKEN",
-            "required when GATEKEEPER_DB_PATH is set",
-        )
-    })?;
-    if client_token.len() < 32 || !client_token.bytes().all(|byte| byte.is_ascii_graphic()) {
+fn storage() -> Result<StorageConfig, ConfigError> {
+    let client_token = optional_env("GATEKEEPER_CLIENT_TOKEN")?;
+    if client_token
+        .as_ref()
+        .is_some_and(|token| token.len() < 32 || !token.bytes().all(|byte| byte.is_ascii_graphic()))
+    {
         return Err(storage_error(
             "GATEKEEPER_CLIENT_TOKEN",
             "expected at least 32 printable ASCII characters without whitespace",
         ));
     }
-    Ok(Some(StorageConfig {
-        path: path.into(),
-        owner,
+    Ok(StorageConfig {
+        path: optional_env("GATEKEEPER_DB_PATH")?.map(Into::into),
         client_token,
-    }))
+    })
 }
 
 fn optional_env(name: &'static str) -> Result<Option<String>, ConfigError> {
@@ -307,12 +295,11 @@ mod tests {
     #[test]
     fn storage_debug_does_not_leak_client_token() {
         let config = StorageConfig {
-            path: "fixture.sqlite3".into(),
-            owner: "owner".to_owned(),
-            client_token: "private-fixture-token".to_owned(),
+            path: Some("fixture.sqlite3".into()),
+            client_token: Some("private-fixture-token".to_owned()),
         };
         let debug = format!("{config:?}");
-        assert!(!debug.contains(&config.client_token));
+        assert!(!debug.contains("private-fixture-token"));
     }
 
     #[test]
